@@ -463,11 +463,10 @@ def main() -> None:
 
         if not args.dry_run:
             _write_lang_marker(season_dir, arc_lang)
+            push_arc_metrics(args.pushgateway, arcs, show_dir)
 
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
-
-    push_arc_metrics(args.pushgateway, arcs, show_dir)
     print(f"\nDone. {stats['downloaded']} new, {stats['skipped']} skipped, {stats['failed']} failed.")
 
 
