@@ -28,6 +28,7 @@ ONEPACE_URL_EN = "https://onepace.net/en/watch"
 PIXELDRAIN_API = "https://pixeldrain.com/api"
 SHOW_DIR_NAME = "One Pace"
 RESOLUTIONS = ["1080p", "720p", "480p"]
+LANG_MARKER = ".lang"
 
 HEADERS = {
     "User-Agent": (
@@ -233,6 +234,7 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
             continue
         entry = dict(arc)
         entry["season"] = season_num
+        entry["lang"] = "en" if arc_id in en_only else "es"
         if arc_id in en_only:
             entry["variant"] = f"{entry['variant']} [EN]"
         arcs.append(entry)
@@ -278,6 +280,28 @@ def download_file(file_id: str, dest_path: Path, dry_run: bool = False) -> bool:
         tmp_path.unlink(missing_ok=True)
         print(f"  [err]  {dest_path.name}: {exc}", flush=True)
         return False
+
+
+def _read_lang_marker(season_dir: Path) -> str | None:
+    p = season_dir / LANG_MARKER
+    return p.read_text().strip() if p.exists() else None
+
+
+def _write_lang_marker(season_dir: Path, lang: str) -> None:
+    season_dir.mkdir(parents=True, exist_ok=True)
+    (season_dir / LANG_MARKER).write_text(lang)
+
+
+def _upgrade_season_to_es(season_dir: Path, dry_run: bool) -> None:
+    """Delete EN fallback MKV files so the ES versions can be downloaded fresh."""
+    mkv_files = list(season_dir.glob("*.mkv"))
+    if dry_run:
+        print(f"  [dry]  would replace {len(mkv_files)} EN file(s) with ES version")
+        return
+    for f in mkv_files:
+        f.unlink()
+        print(f"  [del]  {f.name} (EN fallback replaced by ES)")
+    (season_dir / LANG_MARKER).unlink(missing_ok=True)
 
 
 def write_tvshow_nfo(show_dir: Path) -> None:
@@ -356,6 +380,13 @@ def main() -> None:
 
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
+        arc_lang = arc["lang"]
+
+        stored_lang = _read_lang_marker(season_dir)
+        if stored_lang == "en" and arc_lang == "es":
+            print(f"\n[upgrade] S{arc['season']:02d} {arc['title']}: ES now available, replacing EN files")
+            _upgrade_season_to_es(season_dir, args.dry_run)
+
         print(f"\n=== S{arc['season']:02d} {arc['title']} [{arc['resolution']}] — {arc['variant']} ===")
         print(f"    pixeldrain folder: {arc['pd_list_id']}")
 
@@ -393,6 +424,9 @@ def main() -> None:
                         stats["skipped"] += 1
                     else:
                         stats["failed"] += 1
+
+        if not args.dry_run:
+            _write_lang_marker(season_dir, arc_lang)
 
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
