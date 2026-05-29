@@ -38,6 +38,10 @@ HEADERS = {
 }
 
 
+def _escape_label(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def push_metrics(pgw_url: str, stats: dict) -> None:
     """Push download progress to Prometheus Pushgateway."""
     if not pgw_url:
@@ -66,6 +70,36 @@ def push_metrics(pgw_url: str, stats: dict) -> None:
         )
     except Exception as exc:
         print(f"  [warn] Pushgateway unreachable: {exc}")
+
+
+def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
+    """Push per-arc status metrics to Pushgateway under a separate grouping key."""
+    if not pgw_url:
+        return
+    lines = ["# TYPE onepace_arc_episodes_on_disk gauge"]
+    for arc in arcs:
+        season_dir = show_dir / f"Season {arc['season']:02d}"
+        on_disk = len(list(season_dir.glob("*.mkv"))) if season_dir.exists() else 0
+        lang_on_disk = _read_lang_marker(season_dir) or "none"
+        labels = (
+            f'arc_id="{_escape_label(arc["arc_id"])}",'
+            f'title="{_escape_label(arc["title"])}",'
+            f'season="{arc["season"]:02d}",'
+            f'available_es="{arc["available_es"]}",'
+            f'available_en="{arc["available_en"]}",'
+            f'lang="{lang_on_disk}"'
+        )
+        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {on_disk}")
+    payload = "\n".join(lines) + "\n"
+    try:
+        requests.post(
+            f"{pgw_url.rstrip('/')}/metrics/job/one-pace-downloader/type/arc-status",
+            data=payload,
+            headers={"Content-Type": "text/plain"},
+            timeout=5,
+        )
+    except Exception as exc:
+        print(f"  [warn] Pushgateway arc metrics unreachable: {exc}")
 
 
 def check_connectivity() -> None:
@@ -235,6 +269,8 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
         entry = dict(arc)
         entry["season"] = season_num
         entry["lang"] = "en" if arc_id in en_only else "es"
+        entry["available_es"] = "1" if arc_id in es_arcs else "0"
+        entry["available_en"] = "1" if arc_id in en_arcs else "0"
         if arc_id in en_only:
             entry["variant"] = f"{entry['variant']} [EN]"
         arcs.append(entry)
@@ -431,6 +467,7 @@ def main() -> None:
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
 
+    push_arc_metrics(args.pushgateway, arcs, show_dir)
     print(f"\nDone. {stats['downloaded']} new, {stats['skipped']} skipped, {stats['failed']} failed.")
 
 
