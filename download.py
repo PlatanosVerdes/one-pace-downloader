@@ -79,7 +79,7 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
     lines = ["# TYPE onepace_arc_episodes_on_disk gauge"]
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
-        on_disk = len(list(season_dir.glob("*.mkv"))) if season_dir.exists() else 0
+        on_disk = len(list(season_dir.glob("*.mkv")) + list(season_dir.glob("*.mp4"))) if season_dir.exists() else 0
         lang_on_disk = _read_lang_marker(season_dir) or "none"
         labels = (
             f'arc_id="{_escape_label(arc["arc_id"])}",'
