@@ -1,12 +1,20 @@
 # one-pace-downloader
 
-A Python downloader for [One Pace](https://onepace.net/es/watch) episodes, organized for Plex (or any media server that follows the `Show/Season XX/` structure).
+A Python downloader for [One Pace](https://onepace.net/es/watch) episodes, organized for Jellyfin (or any media server that follows the `Show/Season XX/` structure).
 
-Scrapes onepace.net to get the current episode list, then downloads from the pixeldrain folders linked there. Each arc becomes a season folder, so Plex picks it up automatically.
+Scrapes onepace.net to get the current episode list, then downloads from the pixeldrain folders linked there. Each arc becomes a season folder, so Jellyfin picks it up automatically.
 
 Inspired by [one-pace-for-plex](https://github.com/SpykerNZ/one-pace-for-plex) by [@SpykerNZ](https://github.com/SpykerNZ).
 
 > One Pace content belongs to its creators. This tool only automates downloading files that are already publicly linked on [onepace.net](https://onepace.net).
+
+---
+
+## How it works
+
+1. Scrapes `onepace.net/es/watch` (Spanish) first.
+2. For any arc not yet available in Spanish, falls back to `onepace.net/en/watch` automatically. Affected arcs are logged and tagged `[EN]` in the output.
+3. After each download, writes a `.lang` marker per season (`es` or `en`). On subsequent runs, if a season was downloaded in English but a Spanish version is now available, the English files are deleted and re-downloaded in Spanish automatically.
 
 ---
 
@@ -35,7 +43,7 @@ python3 download.py --resolution 1080p --output /your/media/series
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--resolution` | `1080p` | Preferred resolution (`1080p`, `720p`, `480p`). Falls back to next best if unavailable. |
-| `--audio` | `subs` | `subs` = subtitles, `dub` = Spanish dub |
+| `--audio` | `subs` | `subs` = subtitles/subtitulos, `dub` = dub/doblaje |
 | `--no-extended` | *(off)* | Skip Extended Cut even when available (default: prefer it) |
 | `--output` | `/mnt/data/series` | Root media directory |
 | `--dry-run` | *(off)* | Print what would be downloaded without downloading anything |
@@ -65,12 +73,14 @@ Episodes are saved as:
 ```
 <output>/
 └── One Pace/
-    ├── Season 01/   ← Romance Dawn
-    ├── Season 02/   ← Orange Town
+    ├── Season 01/       <- Romance Dawn
+    │   ├── .lang        <- "es" or "en" (auto-upgrade marker)
+    │   └── *.mp4
+    ├── Season 02/       <- Orange Town
     └── ...
 ```
 
-Each arc maps to a season number in scrape order, matching how One Pace numbers them on onepace.net.
+Each arc maps to a season number based on its position on onepace.net. Season numbers are stable: arcs keep their number even if earlier arcs are missing.
 
 ---
 
@@ -78,11 +88,17 @@ Each arc maps to a season number in scrape order, matching how One Pace numbers 
 
 If you run a Prometheus Pushgateway, pass `--pushgateway http://pushgateway:9091` to get:
 
+**Aggregate (per run):**
 - `onepace_episodes_new_downloads`
 - `onepace_episodes_on_disk`
 - `onepace_episodes_failed`
 - `onepace_arcs_done` / `onepace_arcs_total`
 - `onepace_last_run_seconds`
+
+**Per arc** (pushed to `/type/arc-status` grouping key):
+- `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang}`
+
+The per-arc metric powers the Arc Status table in Grafana, showing which arcs are available in Spanish/English and what language is currently on disk.
 
 ---
 
