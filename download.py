@@ -2,8 +2,9 @@
 """
 One Pace downloader for Jellyfin.
 
-Scrapes onepace.net/es/watch, maps each arc to a Season folder,
-and downloads from pixeldrain (API, no auth required for public files).
+Scrapes onepace.net/es/watch (Spanish), then onepace.net/en/watch as fallback
+for arcs not yet available in Spanish. Maps each arc to a Season folder and
+downloads from pixeldrain (API, no auth required for public files).
 
 Usage:
     python3 download.py [--resolution 1080p] [--output /mnt/data/series]
@@ -22,7 +23,8 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-ONEPACE_URL = "https://onepace.net/es/watch"
+ONEPACE_URL_ES = "https://onepace.net/es/watch"
+ONEPACE_URL_EN = "https://onepace.net/en/watch"
 PIXELDRAIN_API = "https://pixeldrain.com/api"
 SHOW_DIR_NAME = "One Pace"
 RESOLUTIONS = ["1080p", "720p", "480p"]
@@ -123,10 +125,11 @@ def _pick_group(groups: list[dict], audio: str, extended: bool) -> dict | None:
     extended: True  = prefer Extended Cut over regular when available
               False = prefer regular, ignore Extended Cut
     Alternate Cut (e.g. G-8) is never picked automatically.
+    Handles both Spanish labels (subtitulo/doblaje) and English labels (subtitle/dub).
     """
     def lower(g): return g["label"].lower()
-    is_subs     = lambda g: "subtitulo" in lower(g)
-    is_dub      = lambda g: "doblaje" in lower(g)
+    is_subs     = lambda g: "subtitulo" in lower(g) or "subtitle" in lower(g)
+    is_dub      = lambda g: "doblaje" in lower(g) or ("dub" in lower(g) and "subtitle" not in lower(g))
     is_extended = lambda g: "extended cut" in lower(g)
     is_alternate = lambda g: "alternate cut" in lower(g)
     is_regular  = lambda g: not is_extended(g) and not is_alternate(g)
@@ -157,10 +160,14 @@ def _pick_resolution(links: dict, resolution: str) -> tuple[str, str] | None:
     return None
 
 
-def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> list[dict]:
-    """Scrape onepace.net and return list of arc dicts with pixeldrain folder IDs."""
-    print(f"Fetching {ONEPACE_URL} ...")
-    resp = requests.get(ONEPACE_URL, headers=HEADERS, timeout=30)
+def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple[list[str], dict[str, dict]]:
+    """
+    Scrape a onepace.net watch page.
+    Returns (ordered_arc_ids, resolved_arcs) where resolved_arcs maps arc_id -> arc dict
+    for arcs that have downloadable content matching the given preferences.
+    """
+    print(f"Fetching {url} ...")
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -169,8 +176,10 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
         if li.get("id")
     ]
 
-    arcs = []
-    for season_num, li in enumerate(arc_lis, start=1):
+    ordered_ids = [li["id"] for li in arc_lis]
+    resolved: dict[str, dict] = {}
+
+    for li in arc_lis:
         arc_id = li["id"]
         h2 = li.find("h2")
         title = h2.get_text(strip=True) if h2 else arc_id.replace("-", " ").title()
@@ -183,22 +192,50 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
         if not group:
             continue
 
-        result = _pick_resolution(group["links"], resolution)
-        if not result:
+        pick = _pick_resolution(group["links"], resolution)
+        if not pick:
             continue
 
-        chosen_res, chosen_url = result
-        pd_id = chosen_url.rstrip("/").split("/")[-1]
-
-        arcs.append({
-            "season": season_num,
+        chosen_res, chosen_url = pick
+        resolved[arc_id] = {
             "arc_id": arc_id,
             "title": title,
             "resolution": chosen_res,
             "variant": group["label"],
-            "pd_list_id": pd_id,
+            "pd_list_id": chosen_url.rstrip("/").split("/")[-1],
             "pd_url": chosen_url,
-        })
+        }
+
+    return ordered_ids, resolved
+
+
+def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> list[dict]:
+    """
+    Scrape ES page first; fall back to EN for any arc not available in Spanish.
+    Season numbers reflect each arc's position in the merged ordered list,
+    so they remain stable as new arcs are added to either page.
+    """
+    es_ordered, es_arcs = _scrape_page(ONEPACE_URL_ES, resolution, audio, extended)
+    en_ordered, en_arcs = _scrape_page(ONEPACE_URL_EN, resolution, audio, extended)
+
+    # Merge ordering: ES arcs first (preserving their positions), then any EN-only arcs
+    seen = set(es_ordered)
+    all_ordered = es_ordered + [aid for aid in en_ordered if aid not in seen]
+
+    en_only = set(en_arcs) - set(es_arcs)
+    if en_only:
+        print(f"  [info] {len(en_only)} arc(s) not in ES, using EN: {', '.join(sorted(en_only))}")
+
+    arcs = []
+    for season_num, arc_id in enumerate(all_ordered, start=1):
+        arc = es_arcs.get(arc_id) or en_arcs.get(arc_id)
+        if arc is None:
+            continue
+        entry = dict(arc)
+        entry["season"] = season_num
+        if arc_id in en_only:
+            entry["variant"] = f"{entry['variant']} [EN]"
+        arcs.append(entry)
 
     return arcs
 
@@ -260,7 +297,7 @@ def main() -> None:
     parser.add_argument(
         "--audio", default="subs",
         choices=["subs", "dub"],
-        help="Audio preference: subs=subtitulos, dub=doblaje (default: subs)",
+        help="Audio preference: subs=subtitles/subtitulos, dub=dub/doblaje (default: subs)",
     )
     parser.add_argument(
         "--no-extended", dest="extended", action="store_false", default=True,
