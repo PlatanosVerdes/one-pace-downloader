@@ -28,6 +28,7 @@ ONEPACE_URL_EN = "https://onepace.net/en/watch"
 PIXELDRAIN_API = "https://pixeldrain.com/api"
 SHOW_DIR_NAME = "One Pace"
 RESOLUTIONS = ["1080p", "720p", "480p"]
+LANG_MARKER = ".lang"
 
 HEADERS = {
     "User-Agent": (
@@ -35,6 +36,10 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+def _escape_label(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def push_metrics(pgw_url: str, stats: dict) -> None:
@@ -65,6 +70,58 @@ def push_metrics(pgw_url: str, stats: dict) -> None:
         )
     except Exception as exc:
         print(f"  [warn] Pushgateway unreachable: {exc}")
+
+
+def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
+    """Push per-arc status metrics to Pushgateway under a separate grouping key."""
+    if not pgw_url:
+        return
+    lines = ["# TYPE onepace_arc_episodes_on_disk gauge"]
+    for arc in arcs:
+        season_dir = show_dir / f"Season {arc['season']:02d}"
+        on_disk = len(list(season_dir.glob("*.mkv"))) if season_dir.exists() else 0
+        lang_on_disk = _read_lang_marker(season_dir) or "none"
+        labels = (
+            f'arc_id="{_escape_label(arc["arc_id"])}",'
+            f'title="{_escape_label(arc["title"])}",'
+            f'season="{arc["season"]:02d}",'
+            f'available_es="{arc["available_es"]}",'
+            f'available_en="{arc["available_en"]}",'
+            f'lang="{lang_on_disk}"'
+        )
+        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {on_disk}")
+    payload = "\n".join(lines) + "\n"
+    try:
+        requests.post(
+            f"{pgw_url.rstrip('/')}/metrics/job/one-pace-downloader/type/arc-status",
+            data=payload,
+            headers={"Content-Type": "text/plain"},
+            timeout=5,
+        )
+    except Exception as exc:
+        print(f"  [warn] Pushgateway arc metrics unreachable: {exc}")
+
+
+def _read_lang_marker(season_dir: Path) -> str | None:
+    p = season_dir / LANG_MARKER
+    return p.read_text().strip() if p.exists() else None
+
+
+def _write_lang_marker(season_dir: Path, lang: str) -> None:
+    season_dir.mkdir(parents=True, exist_ok=True)
+    (season_dir / LANG_MARKER).write_text(lang)
+
+
+def _upgrade_season_to_es(season_dir: Path, dry_run: bool) -> None:
+    """Delete EN fallback MKV files so the ES versions can be downloaded fresh."""
+    mkv_files = list(season_dir.glob("*.mkv"))
+    if dry_run:
+        print(f"  [dry]  would replace {len(mkv_files)} EN file(s) with ES version")
+        return
+    for f in mkv_files:
+        f.unlink()
+        print(f"  [del]  {f.name} (EN fallback replaced by ES)")
+    (season_dir / LANG_MARKER).unlink(missing_ok=True)
 
 
 def check_connectivity() -> None:
@@ -233,6 +290,9 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
             continue
         entry = dict(arc)
         entry["season"] = season_num
+        entry["lang"] = "en" if arc_id in en_only else "es"
+        entry["available_es"] = "1" if arc_id in es_arcs else "0"
+        entry["available_en"] = "1" if arc_id in en_arcs else "0"
         if arc_id in en_only:
             entry["variant"] = f"{entry['variant']} [EN]"
         arcs.append(entry)
@@ -356,6 +416,13 @@ def main() -> None:
 
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
+        arc_lang = arc["lang"]
+
+        stored_lang = _read_lang_marker(season_dir)
+        if stored_lang == "en" and arc_lang == "es":
+            print(f"\n[upgrade] S{arc['season']:02d} {arc['title']}: ES now available, replacing EN files")
+            _upgrade_season_to_es(season_dir, args.dry_run)
+
         print(f"\n=== S{arc['season']:02d} {arc['title']} [{arc['resolution']}] — {arc['variant']} ===")
         print(f"    pixeldrain folder: {arc['pd_list_id']}")
 
@@ -394,9 +461,13 @@ def main() -> None:
                     else:
                         stats["failed"] += 1
 
+        if not args.dry_run:
+            _write_lang_marker(season_dir, arc_lang)
+
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
 
+    push_arc_metrics(args.pushgateway, arcs, show_dir)
     print(f"\nDone. {stats['downloaded']} new, {stats['skipped']} skipped, {stats['failed']} failed.")
 
 
