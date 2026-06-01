@@ -379,21 +379,22 @@ def fetch_nfo_index() -> dict[tuple[int, int], str]:
     return result
 
 
-def _normalize_title(t: str) -> str:
-    return t.lower().replace("whiskey", "whisky").replace("arabasta", "alabasta")
-
-
-def _match_official_season(arc_title: str, official: dict[str, int]) -> int | None:
-    norm = _normalize_title(arc_title)
-    return next((v for k, v in official.items() if _normalize_title(k) == norm), None)
+def _match_official_season(arc_id: str, official: dict[str, int]) -> int | None:
+    """Match arc_id (URL slug, always English) against seasons.json keys slugified."""
+    for k, v in official.items():
+        slug = re.sub(r"[^a-z0-9]+", "-", k.lower()).strip("-")
+        if slug == arc_id:
+            return v
+    return None
 
 
 def _extract_ep_num(filename: str) -> int | None:
-    """Extract episode number from a pixeldrain One Pace filename."""
-    m = re.search(r"-\s+(\d{1,3})\s*\[", filename)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"[Ee]pisode\s+(\d{1,3})", filename)
+    """Extract episode number from a pixeldrain One Pace filename.
+
+    Format: [One Pace][...] Arc Name NN [resolution][...].mp4
+    NN may be followed by ' Extended' or similar before the resolution tag.
+    """
+    m = re.search(r" (\d{1,2})\s+(?:Extended\s+|Alternate\s+\S+\s+)?\[\d+p\]", filename)
     if m:
         return int(m.group(1))
     return None
@@ -431,7 +432,7 @@ def write_arc_metadata(
     if not season_dir.exists():
         return
 
-    off_season = _match_official_season(arc["title"], official)
+    off_season = _match_official_season(arc["arc_id"], official)
     if off_season is None:
         print(f"  [meta] No season match for '{arc['title']}', skipping NFOs")
         return
