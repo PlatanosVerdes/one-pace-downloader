@@ -343,6 +343,120 @@ def download_file(file_id: str, dest_path: Path, dry_run: bool = False) -> bool:
         return False
 
 
+def _parse_nfo_fields(nfo_path: Path) -> tuple[str, str]:
+    """Return (title, plot) from an NFO file, or ('', '') on failure."""
+    try:
+        root = ET.parse(nfo_path).getroot()
+        return root.findtext("title", "").strip(), root.findtext("plot", "").strip()
+    except Exception:
+        return "", ""
+
+
+import xml.etree.ElementTree as ET
+
+
+class PlexClient:
+    """Thin Plex API client for syncing NFO metadata after downloads."""
+
+    def __init__(self, url: str, token: str, plex_path: str, host_path: str) -> None:
+        self._url = url.rstrip("/")
+        self._token = token
+        self._plex_path = plex_path.rstrip("/")
+        self._host_path = host_path.rstrip("/")
+        self._show_key: str | None = None
+        self._season_keys: dict[int, str] = {}
+
+    def _headers(self) -> dict:
+        return {"X-Plex-Token": self._token}
+
+    def _get(self, path: str) -> ET.Element:
+        r = requests.get(f"{self._url}{path}", headers=self._headers(), timeout=15)
+        r.raise_for_status()
+        return ET.fromstring(r.text)
+
+    def _translate(self, plex_file: str) -> Path:
+        if self._plex_path and self._plex_path != self._host_path:
+            return Path(plex_file.replace(self._plex_path, self._host_path, 1))
+        return Path(plex_file)
+
+    def _find_show(self, title: str) -> bool:
+        try:
+            for section in self._get("/library/sections").findall("Directory"):
+                for show in self._get(f"/library/sections/{section.get('key')}/all").findall("Directory"):
+                    if show.get("title") == title:
+                        self._show_key = show.get("ratingKey")
+                        return True
+        except Exception as exc:
+            print(f"  [plex] Could not locate show: {exc}")
+        return False
+
+    def _season_key(self, season_num: int, show_title: str) -> str | None:
+        if not self._season_keys:
+            if self._show_key is None and not self._find_show(show_title):
+                return None
+            try:
+                for d in self._get(f"/library/metadata/{self._show_key}/children").findall("Directory"):
+                    if d.get("index"):
+                        self._season_keys[int(d.get("index"))] = d.get("ratingKey")
+            except Exception as exc:
+                print(f"  [plex] Could not get seasons: {exc}")
+                return None
+        return self._season_keys.get(season_num)
+
+    def sync_season(self, season_num: int, season_dir: Path, show_title: str) -> None:
+        key = self._season_key(season_num, show_title)
+        if not key:
+            return
+        snfo = season_dir / "season.nfo"
+        if snfo.exists():
+            title, plot = _parse_nfo_fields(snfo)
+            if title:
+                params: dict = {"X-Plex-Token": self._token, "title.value": title, "title.locked": "1"}
+                if plot:
+                    params.update({"summary.value": plot, "summary.locked": "1"})
+                requests.put(f"{self._url}/library/metadata/{key}", params=params, timeout=15)
+                print(f"  [plex] S{season_num:02d} season synced")
+        poster = season_dir / "poster.png"
+        if poster.exists():
+            with open(poster, "rb") as f:
+                requests.post(
+                    f"{self._url}/library/metadata/{key}/posters",
+                    headers={**self._headers(), "Content-Type": "image/png"},
+                    data=f.read(), timeout=30,
+                )
+            print(f"  [plex] S{season_num:02d} poster uploaded")
+
+    def sync_episodes(self, season_num: int, season_dir: Path, show_title: str) -> None:
+        key = self._season_key(season_num, show_title)
+        if not key:
+            return
+        try:
+            episodes = self._get(f"/library/metadata/{key}/children").findall("Video")
+        except Exception as exc:
+            print(f"  [plex] Could not get episodes for S{season_num:02d}: {exc}")
+            return
+        synced = 0
+        for ep in episodes:
+            if ep.get("guid", "").startswith("plex://"):
+                continue
+            part = ep.find("Media/Part")
+            if part is None:
+                continue
+            nfo = self._translate(part.get("file", "")).with_suffix(".nfo")
+            if not nfo.exists():
+                continue
+            title, plot = _parse_nfo_fields(nfo)
+            if not title:
+                continue
+            params = {"X-Plex-Token": self._token, "title.value": title, "title.locked": "1"}
+            if plot:
+                params.update({"summary.value": plot, "summary.locked": "1"})
+            requests.put(f"{self._url}/library/metadata/{ep.get('ratingKey')}", params=params, timeout=15)
+            synced += 1
+        if synced:
+            print(f"  [plex] S{season_num:02d} {synced} episode(s) synced")
+
+
 def fetch_official_seasons() -> dict[str, int]:
     """Download seasons.json from one-pace-for-plex. Returns arc_title -> official_season_num."""
     try:
@@ -429,17 +543,18 @@ def write_arc_metadata(
     official: dict[str, int],
     nfo_index: dict[tuple[int, int], str],
     dry_run: bool,
-) -> None:
-    """Write poster, season.nfo, and per-episode NFOs for one arc."""
+) -> bool:
+    """Write poster, season.nfo, and per-episode NFOs for one arc. Returns True if anything was written."""
     if not season_dir.exists():
-        return
+        return False
 
     off_season = _match_official_season(arc["arc_id"], official)
     if off_season is None:
         print(f"  [meta] No season match for '{arc['title']}', skipping NFOs")
-        return
+        return False
 
     our_season = arc["season"]
+    wrote_something = False
 
     # Season poster
     poster_path = season_dir / "poster.png"
@@ -450,6 +565,7 @@ def write_arc_metadata(
         elif (data := _fetch_bytes(url)):
             poster_path.write_bytes(data)
             print(f"  [meta] poster.png")
+            wrote_something = True
         else:
             print(f"  [warn] Could not download poster for season {off_season}")
 
@@ -462,6 +578,7 @@ def write_arc_metadata(
         elif (text := _fetch_text(url)):
             snfo_path.write_text(text, encoding="utf-8")
             print(f"  [meta] season.nfo")
+            wrote_something = True
         else:
             print(f"  [warn] Could not download season.nfo for season {off_season}")
 
@@ -485,8 +602,11 @@ def write_arc_metadata(
             adapted = _adapt_nfo_season(text, our_season)
             nfo_path.write_text(adapted, encoding="utf-8")
             print(f"  [meta] E{ep:02d}.nfo -> {nfo_path.name}")
+            wrote_something = True
         else:
             print(f"  [warn] Could not download NFO for E{ep:02d}")
+
+    return wrote_something
 
 
 def write_tvshow_nfo(show_dir: Path, dry_run: bool = False) -> None:
@@ -545,7 +665,32 @@ def main() -> None:
         "--no-metadata", dest="metadata", action="store_false", default=True,
         help="Skip fetching NFOs, posters, and season metadata from GitHub",
     )
+    parser.add_argument(
+        "--plex-url", default=None, metavar="URL",
+        help="Plex server URL for automatic metadata sync (e.g. http://localhost:32400)",
+    )
+    parser.add_argument(
+        "--plex-token", default=None, metavar="TOKEN",
+        help="Plex API token",
+    )
+    parser.add_argument(
+        "--plex-path", default=None, metavar="PATH",
+        help="Media root path as seen by Plex (default: same as --output). "
+             "Set this if Plex runs in a container with a different mount path, "
+             "e.g. /data/series when --output is /mnt/data/series",
+    )
     args = parser.parse_args()
+
+    plex: PlexClient | None = None
+    if args.plex_url and args.plex_token:
+        plex = PlexClient(
+            url=args.plex_url,
+            token=args.plex_token,
+            plex_path=args.plex_path or args.output,
+            host_path=args.output,
+        )
+    elif args.plex_url or args.plex_token:
+        print("[warn] Both --plex-url and --plex-token are required for Plex sync")
 
     check_connectivity()
     arcs = fetch_arcs(args.resolution, audio=args.audio, extended=args.extended)
@@ -634,8 +779,16 @@ def main() -> None:
             _write_lang_marker(season_dir, arc_lang)
             push_arc_metrics(args.pushgateway, arcs, show_dir)
 
+        arc_new = stats["downloaded"] - stats.get("_prev_downloaded", 0)
+        stats["_prev_downloaded"] = stats["downloaded"]
+
+        wrote_meta = False
         if args.metadata:
-            write_arc_metadata(arc, season_dir, official_seasons, nfo_index, args.dry_run)
+            wrote_meta = write_arc_metadata(arc, season_dir, official_seasons, nfo_index, args.dry_run)
+
+        if plex and not args.dry_run and (arc_new > 0 or wrote_meta):
+            plex.sync_season(arc["season"], season_dir, SHOW_DIR_NAME)
+            plex.sync_episodes(arc["season"], season_dir, SHOW_DIR_NAME)
 
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
