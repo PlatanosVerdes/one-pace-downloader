@@ -50,6 +50,10 @@ python3 download.py --resolution 1080p --output /your/media/series
 | `--arc <id>` | *(all)* | Download a specific arc + the next one (e.g. `--arc skypiea`) |
 | `--list-arcs` | *(off)* | List all available arcs and exit |
 | `--pushgateway <url>` | *(off)* | Push download metrics to a Prometheus Pushgateway |
+| `--no-metadata` | *(off)* | Skip fetching NFOs, posters, and season metadata from GitHub |
+| `--plex-url <url>` | *(off)* | Plex server URL for automatic metadata sync (e.g. `http://localhost:32400`) |
+| `--plex-token <token>` | *(off)* | Plex API token (required with `--plex-url`) |
+| `--plex-path <path>` | same as `--output` | Media root path as seen by Plex. Set this if Plex runs in a container with a different mount path (e.g. `/data/series` when `--output` is `/mnt/data/series`) |
 
 ### List available arcs
 
@@ -81,6 +85,32 @@ Episodes are saved as:
 ```
 
 Each arc maps to a season number based on its position on onepace.net. Season numbers are stable: arcs keep their number even if earlier arcs are missing.
+
+---
+
+## Plex integration
+
+Pass `--plex-url` and `--plex-token` to automatically sync metadata to Plex after each arc is processed. Whenever new episodes are downloaded or new NFOs are written, the downloader will:
+
+1. Inject the season title and description (from `season.nfo`) into Plex.
+2. Upload the season poster (from `poster.png`) to Plex.
+3. Inject episode titles and descriptions (from per-episode NFOs) for any episodes not already matched to Plex's cloud database.
+
+```bash
+docker run --rm -v /your/media/series:/mnt/data/series one-pace-downloader \
+  --resolution 1080p \
+  --output /mnt/data/series \
+  --plex-url http://plex:32400 \
+  --plex-token YOUR_TOKEN
+```
+
+If Plex runs in a separate container where the media is mounted at a different path, use `--plex-path` to tell the downloader how Plex sees the files:
+
+```bash
+  --plex-path /data/series   # path as Plex's container sees it
+```
+
+> The Plex library must have **Local Media Assets** enabled (it is by default). The `--plex-url` and `--plex-token` flags are both required for sync to activate; omitting either silently skips Plex integration.
 
 ---
 
