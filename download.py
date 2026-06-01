@@ -494,6 +494,7 @@ def write_tvshow_nfo(show_dir: Path, dry_run: bool = False) -> None:
         print(f"  [dry]  would update tvshow.nfo")
         return
     if (text := _fetch_text(url)):
+        text = re.sub(r"<originaltitle>.*?</originaltitle>", "<originaltitle>One Pace</originaltitle>", text)
         nfo_path.write_text(text, encoding="utf-8")
         print(f"[meta] tvshow.nfo updated from GitHub")
     elif not nfo_path.exists():
