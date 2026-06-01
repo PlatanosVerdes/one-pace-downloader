@@ -19,6 +19,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,6 +27,8 @@ from bs4 import BeautifulSoup
 ONEPACE_URL_ES = "https://onepace.net/es/watch"
 ONEPACE_URL_EN = "https://onepace.net/en/watch"
 PIXELDRAIN_API = "https://pixeldrain.com/api"
+GITHUB_RAW = "https://raw.githubusercontent.com/SpykerNZ/one-pace-for-plex/main"
+GITHUB_API = "https://api.github.com/repos/SpykerNZ/one-pace-for-plex"
 SHOW_DIR_NAME = "One Pace"
 RESOLUTIONS = ["1080p", "720p", "480p"]
 LANG_MARKER = ".lang"
@@ -340,11 +343,161 @@ def download_file(file_id: str, dest_path: Path, dry_run: bool = False) -> bool:
         return False
 
 
-def write_tvshow_nfo(show_dir: Path) -> None:
+def fetch_official_seasons() -> dict[str, int]:
+    """Download seasons.json from one-pace-for-plex. Returns arc_title -> official_season_num."""
+    try:
+        r = requests.get(f"{GITHUB_RAW}/dist/seasons.json", headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        print(f"[warn] Could not fetch seasons.json from GitHub: {exc}")
+        return {}
+
+
+def fetch_nfo_index() -> dict[tuple[int, int], str]:
+    """
+    Fetch the full GitHub repo tree in one API call.
+    Returns {(official_season, episode_num): raw_download_url}.
+    """
+    try:
+        r = requests.get(
+            f"{GITHUB_API}/git/trees/main?recursive=1",
+            headers=HEADERS,
+            timeout=30,
+        )
+        r.raise_for_status()
+    except Exception as exc:
+        print(f"[warn] Could not fetch NFO index from GitHub: {exc}")
+        return {}
+
+    nfo_re = re.compile(r"One Pace/Season (\d+)/One Pace - S\d+E(\d+) - .+\.nfo$")
+    result = {}
+    for item in r.json().get("tree", []):
+        m = nfo_re.match(item["path"])
+        if m:
+            result[(int(m.group(1)), int(m.group(2)))] = f"{GITHUB_RAW}/{quote(item['path'])}"
+    return result
+
+
+def _normalize_title(t: str) -> str:
+    return t.lower().replace("whiskey", "whisky").replace("arabasta", "alabasta")
+
+
+def _match_official_season(arc_title: str, official: dict[str, int]) -> int | None:
+    norm = _normalize_title(arc_title)
+    return next((v for k, v in official.items() if _normalize_title(k) == norm), None)
+
+
+def _extract_ep_num(filename: str) -> int | None:
+    """Extract episode number from a pixeldrain One Pace filename."""
+    m = re.search(r"-\s+(\d{1,3})\s*\[", filename)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"[Ee]pisode\s+(\d{1,3})", filename)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _fetch_bytes(url: str) -> bytes | None:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        return r.content if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _fetch_text(url: str) -> str | None:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        return r.text if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _adapt_nfo_season(content: str, our_season: int) -> str:
+    """Replace the <season> tag to match our folder numbering."""
+    return re.sub(r"<season>\d+</season>", f"<season>{our_season}</season>", content)
+
+
+def write_arc_metadata(
+    arc: dict,
+    season_dir: Path,
+    official: dict[str, int],
+    nfo_index: dict[tuple[int, int], str],
+    dry_run: bool,
+) -> None:
+    """Write poster, season.nfo, and per-episode NFOs for one arc."""
+    if not season_dir.exists():
+        return
+
+    off_season = _match_official_season(arc["title"], official)
+    if off_season is None:
+        print(f"  [meta] No season match for '{arc['title']}', skipping NFOs")
+        return
+
+    our_season = arc["season"]
+
+    # Season poster
+    poster_path = season_dir / "poster.png"
+    if not poster_path.exists():
+        url = f"{GITHUB_RAW}/One%20Pace/season{off_season:02d}-poster.png"
+        if dry_run:
+            print(f"  [dry]  would download poster.png")
+        elif (data := _fetch_bytes(url)):
+            poster_path.write_bytes(data)
+            print(f"  [meta] poster.png")
+        else:
+            print(f"  [warn] Could not download poster for season {off_season}")
+
+    # season.nfo
+    snfo_path = season_dir / "season.nfo"
+    if not snfo_path.exists():
+        url = f"{GITHUB_RAW}/One%20Pace/Season%20{off_season}/season.nfo"
+        if dry_run:
+            print(f"  [dry]  would write season.nfo")
+        elif (text := _fetch_text(url)):
+            snfo_path.write_text(text, encoding="utf-8")
+            print(f"  [meta] season.nfo")
+        else:
+            print(f"  [warn] Could not download season.nfo for season {off_season}")
+
+    # Per-episode NFOs
+    video_files = sorted(list(season_dir.glob("*.mkv")) + list(season_dir.glob("*.mp4")))
+    for vf in video_files:
+        nfo_path = vf.with_suffix(".nfo")
+        if nfo_path.exists():
+            continue
+        ep = _extract_ep_num(vf.name)
+        if ep is None:
+            print(f"  [warn] Could not parse episode number from {vf.name}")
+            continue
+        url = nfo_index.get((off_season, ep))
+        if url is None:
+            print(f"  [warn] No NFO found for S{off_season:02d}E{ep:02d} ({vf.name})")
+            continue
+        if dry_run:
+            print(f"  [dry]  would write NFO for E{ep:02d}")
+        elif (text := _fetch_text(url)):
+            adapted = _adapt_nfo_season(text, our_season)
+            nfo_path.write_text(adapted, encoding="utf-8")
+            print(f"  [meta] E{ep:02d}.nfo -> {nfo_path.name}")
+        else:
+            print(f"  [warn] Could not download NFO for E{ep:02d}")
+
+
+def write_tvshow_nfo(show_dir: Path, dry_run: bool = False) -> None:
     nfo_path = show_dir / "tvshow.nfo"
-    if not nfo_path.exists():
+    url = f"{GITHUB_RAW}/One%20Pace/tvshow.nfo"
+    if dry_run:
+        print(f"  [dry]  would update tvshow.nfo")
+        return
+    if (text := _fetch_text(url)):
+        nfo_path.write_text(text, encoding="utf-8")
+        print(f"[meta] tvshow.nfo updated from GitHub")
+    elif not nfo_path.exists():
         nfo_path.write_text(TVSHOW_NFO, encoding="utf-8")
-        print(f"Created {nfo_path}")
+        print(f"[meta] tvshow.nfo written (fallback)")
 
 
 def main() -> None:
@@ -384,10 +537,22 @@ def main() -> None:
         metavar="URL",
         help="Prometheus Pushgateway URL (e.g. http://pushgateway:9091)",
     )
+    parser.add_argument(
+        "--no-metadata", dest="metadata", action="store_false", default=True,
+        help="Skip fetching NFOs, posters, and season metadata from GitHub",
+    )
     args = parser.parse_args()
 
     check_connectivity()
     arcs = fetch_arcs(args.resolution, audio=args.audio, extended=args.extended)
+
+    official_seasons: dict[str, int] = {}
+    nfo_index: dict[tuple[int, int], str] = {}
+    if args.metadata and not args.list_arcs:
+        print("Fetching metadata index from GitHub...")
+        official_seasons = fetch_official_seasons()
+        nfo_index = fetch_nfo_index()
+        print(f"  {len(nfo_index)} episode NFOs indexed")
 
     if args.list_arcs:
         print(f"\n{'S#':>4}  {'Arc ID':<35} {'Title':<30} {'Res':<6} {'Variant'}")
@@ -409,7 +574,7 @@ def main() -> None:
 
     if not args.dry_run:
         show_dir.mkdir(parents=True, exist_ok=True)
-        write_tvshow_nfo(show_dir)
+        write_tvshow_nfo(show_dir, dry_run=args.dry_run)
 
     stats = {"downloaded": 0, "skipped": 0, "failed": 0, "arcs_done": 0, "arcs_total": len(arcs)}
     push_metrics(args.pushgateway, stats)
@@ -464,6 +629,9 @@ def main() -> None:
         if not args.dry_run:
             _write_lang_marker(season_dir, arc_lang)
             push_arc_metrics(args.pushgateway, arcs, show_dir)
+
+        if args.metadata:
+            write_arc_metadata(arc, season_dir, official_seasons, nfo_index, args.dry_run)
 
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
