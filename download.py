@@ -382,8 +382,10 @@ def fetch_nfo_index() -> dict[tuple[int, int], str]:
 def _match_official_season(arc_id: str, official: dict[str, int]) -> int | None:
     """Match arc_id (URL slug, always English) against seasons.json keys slugified."""
     for k, v in official.items():
-        slug = re.sub(r"[^a-z0-9]+", "-", k.lower()).strip("-")
-        if slug == arc_id:
+        # Drop apostrophes before slugifying (arc_ids omit them; a plain replace would insert a hyphen)
+        k_clean = re.sub(r"['’]", "", k)
+        slug = re.sub(r"[^a-z0-9]+", "-", k_clean.lower()).strip("-")
+        if slug == arc_id or arc_id.endswith("-" + slug):
             return v
     return None
 
