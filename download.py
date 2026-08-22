@@ -31,6 +31,11 @@ GITHUB_RAW = "https://raw.githubusercontent.com/SpykerNZ/one-pace-for-plex/main"
 GITHUB_API = "https://api.github.com/repos/SpykerNZ/one-pace-for-plex"
 SHOW_DIR_NAME = "One Pace"
 RESOLUTIONS = ["1080p", "720p", "480p"]
+# A pixeldrain folder holds whatever the release group left there, notes included. One of them,
+# `wip.md`, answers 451 Unavailable For Legal Reasons, so every nightly run ended with one failure
+# and the "One Pace downloads failing" alert could never clear: twelve runs in a row before anyone
+# read it. Only video files were ever wanted.
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".m4v"}
 LANG_MARKER = ".lang"
 
 HEADERS = {
@@ -753,6 +758,12 @@ def main() -> None:
             stats["arcs_done"] += 1
             push_metrics(args.pushgateway, stats)
             continue
+
+        extras = [f for f in files if Path(f["name"]).suffix.lower() not in VIDEO_SUFFIXES]
+        files = [f for f in files if Path(f["name"]).suffix.lower() in VIDEO_SUFFIXES]
+        if extras:
+            print(f"  {len(extras)} non-video file(s) ignored: "
+                  f"{', '.join(f['name'] for f in extras[:3])}")
 
         print(f"  {len(files)} file(s) in folder")
 
