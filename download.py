@@ -122,8 +122,7 @@ def _write_lang_marker(season_dir: Path, marker: str) -> None:
 
 
 def _marker_parts(marker: str | None) -> tuple[str | None, str | None]:
-    """Split a marker into (language, kind). Markers written before the kind was recorded hold
-    only a language, and their kind reads as unknown rather than being guessed."""
+    """Split a marker into (language, kind). An older marker holds only a language."""
     if not marker:
         return None, None
     lang, _, kind = marker.partition("-")
@@ -132,8 +131,7 @@ def _marker_parts(marker: str | None) -> tuple[str | None, str | None]:
 
 def _needs_replacing(stored: str | None, current: str) -> bool:
     """True when what is on disk was taken under preferences that no longer apply. Only the
-    fields the stored marker actually carries are compared, so the markers already out there,
-    which are a bare language, do not condemn the whole library to a re-download."""
+    fields the stored marker carries are compared."""
     stored_lang, stored_kind = _marker_parts(stored)
     if stored_lang is None:
         return False
@@ -205,8 +203,6 @@ def _parse_arc_groups(li) -> list[dict]:
     return groups
 
 
-# Both pages label the same thing in their own language: "Subtitulos en español" and
-# "English Subtitles", "Doblaje en español" and "English Dub".
 def _is_subs(group: dict) -> bool:
     label = group["label"].lower()
     return "subtitulo" in label or "subtitle" in label
@@ -224,14 +220,11 @@ def _kind(group: dict) -> str:
 def _pick_group(groups: list[dict], audio: str, extended: bool) -> dict | None:
     """
     Choose the best group given audio preference and extended preference.
-    audio: 'subs' subtitles over the original audio, 'dub' a dubbed track.
+    audio: 'subs' subtitles over the original audio, 'dub' a dubbed track. Returns None
+           rather than the other one, so the caller can fall back to the other page.
     extended: True  = prefer Extended Cut over regular when available
               False = prefer regular, ignore Extended Cut
     Alternate Cut (e.g. G-8) is never picked automatically.
-
-    There is no crossing over between the two: an arc the Spanish page only offers dubbed
-    returns nothing here, and the caller falls through to the English page for subtitles over
-    the same original audio. Taking the dub instead is how Water Seven ended up in Castilian.
     """
     def lower(g): return g["label"].lower()
     is_extended = lambda g: "extended cut" in lower(g)
