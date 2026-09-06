@@ -14,7 +14,20 @@ Inspired by [one-pace-for-plex](https://github.com/SpykerNZ/one-pace-for-plex) b
 
 1. Scrapes `onepace.net/es/watch` (Spanish) first.
 2. For any arc not yet available in Spanish, falls back to `onepace.net/en/watch` automatically. Affected arcs are logged and tagged `[EN]` in the output.
-3. After each download, writes a `.lang` marker per season (`es` or `en`). On subsequent runs, if a season was downloaded in English but a Spanish version is now available, the English files are deleted and re-downloaded in Spanish automatically.
+3. After each download, writes a `.lang` marker per season (`es-subs`, `en-subs`, `es-dub`). On subsequent runs, a season whose marker no longer matches what the preferences now ask for has its files deleted and re-downloaded. That covers an arc reaching the Spanish page, and an arc that has to stop using what it was taking before.
+
+---
+
+## Which version is taken
+
+In order, and the first one that exists wins:
+
+1. Original audio with Spanish subtitles (`Subtitulos en español`).
+2. Original audio with English subtitles (`English Subtitles`).
+
+A dubbed track is never taken as a fallback. Some arcs are offered on the Spanish page only as `Doblaje en español`, and treating that as "the Spanish version" is how a Castilian-audio Water Seven ended up in the library: an arc like that skips the Spanish page entirely and takes English subtitles over the same original audio.
+
+`--audio dub` reverses the preference, and is just as strict: it takes a dub or nothing.
 
 ---
 
@@ -43,7 +56,7 @@ python3 download.py --resolution 1080p --output /your/media/series
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--resolution` | `1080p` | Preferred resolution (`1080p`, `720p`, `480p`). Falls back to next best if unavailable. |
-| `--audio` | `subs` | `subs` = subtitles/subtitulos, `dub` = dub/doblaje |
+| `--audio` | `subs` | `subs` = original audio with subtitles, `dub` = a dubbed track. The two never cross over: see [Which version is taken](#which-version-is-taken) |
 | `--no-extended` | *(off)* | Skip Extended Cut even when available (default: prefer it) |
 | `--output` | `/mnt/data/series` | Root media directory |
 | `--dry-run` | *(off)* | Print what would be downloaded without downloading anything |
@@ -78,7 +91,7 @@ Episodes are saved as:
 <output>/
 └── One Pace/
     ├── Season 01/       <- Romance Dawn
-    │   ├── .lang        <- "es" or "en" (auto-upgrade marker)
+    │   ├── .lang        <- "es-subs", "en-subs" or "es-dub" (replacement marker)
     │   └── *.mp4
     ├── Season 02/       <- Orange Town
     └── ...
@@ -126,7 +139,7 @@ If you run a Prometheus Pushgateway, pass `--pushgateway http://pushgateway:9091
 - `onepace_last_run_seconds`
 
 **Per arc** (pushed to `/type/arc-status` grouping key):
-- `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang}`
+- `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang, variant}`
 
 The per-arc metric powers the Arc Status table in Grafana, showing which arcs are available in Spanish/English and what language is currently on disk.
 

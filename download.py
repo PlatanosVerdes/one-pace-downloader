@@ -88,14 +88,15 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
         on_disk = len(list(season_dir.glob("*.mkv")) + list(season_dir.glob("*.mp4"))) if season_dir.exists() else 0
-        lang_on_disk = _read_lang_marker(season_dir) or "none"
+        lang_on_disk, variant_on_disk = _marker_parts(_read_lang_marker(season_dir))
         labels = (
             f'arc_id="{_escape_label(arc["arc_id"])}",'
             f'title="{_escape_label(arc["title"])}",'
             f'season="{arc["season"]:02d}",'
             f'available_es="{arc["available_es"]}",'
             f'available_en="{arc["available_en"]}",'
-            f'lang="{lang_on_disk}"'
+            f'lang="{lang_on_disk or "none"}",'
+            f'variant="{variant_on_disk or "unknown"}"'
         )
         lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {on_disk}")
     payload = "\n".join(lines) + "\n"
@@ -115,20 +116,42 @@ def _read_lang_marker(season_dir: Path) -> str | None:
     return p.read_text().strip() if p.exists() else None
 
 
-def _write_lang_marker(season_dir: Path, lang: str) -> None:
+def _write_lang_marker(season_dir: Path, marker: str) -> None:
     season_dir.mkdir(parents=True, exist_ok=True)
-    (season_dir / LANG_MARKER).write_text(lang)
+    (season_dir / LANG_MARKER).write_text(marker)
 
 
-def _upgrade_season_to_es(season_dir: Path, dry_run: bool) -> None:
-    """Delete EN fallback MKV files so the ES versions can be downloaded fresh."""
-    mkv_files = list(season_dir.glob("*.mkv"))
+def _marker_parts(marker: str | None) -> tuple[str | None, str | None]:
+    """Split a marker into (language, kind). Markers written before the kind was recorded hold
+    only a language, and their kind reads as unknown rather than being guessed."""
+    if not marker:
+        return None, None
+    lang, _, kind = marker.partition("-")
+    return lang, kind or None
+
+
+def _needs_replacing(stored: str | None, current: str) -> bool:
+    """True when what is on disk was taken under preferences that no longer apply. Only the
+    fields the stored marker actually carries are compared, so the markers already out there,
+    which are a bare language, do not condemn the whole library to a re-download."""
+    stored_lang, stored_kind = _marker_parts(stored)
+    if stored_lang is None:
+        return False
+    lang, kind = _marker_parts(current)
+    if stored_lang != lang:
+        return True
+    return stored_kind is not None and stored_kind != kind
+
+
+def _clear_season(season_dir: Path, reason: str, dry_run: bool) -> None:
+    """Delete the season's videos so the right variant can be downloaded fresh."""
+    videos = [f for f in season_dir.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES]
     if dry_run:
-        print(f"  [dry]  would replace {len(mkv_files)} EN file(s) with ES version")
+        print(f"  [dry]  would replace {len(videos)} file(s): {reason}")
         return
-    for f in mkv_files:
+    for f in videos:
         f.unlink()
-        print(f"  [del]  {f.name} (EN fallback replaced by ES)")
+        print(f"  [del]  {f.name} ({reason})")
     (season_dir / LANG_MARKER).unlink(missing_ok=True)
 
 
@@ -182,39 +205,49 @@ def _parse_arc_groups(li) -> list[dict]:
     return groups
 
 
+# Both pages label the same thing in their own language: "Subtitulos en español" and
+# "English Subtitles", "Doblaje en español" and "English Dub".
+def _is_subs(group: dict) -> bool:
+    label = group["label"].lower()
+    return "subtitulo" in label or "subtitle" in label
+
+
+def _is_dub(group: dict) -> bool:
+    label = group["label"].lower()
+    return "doblaje" in label or ("dub" in label and "subtitle" not in label)
+
+
+def _kind(group: dict) -> str:
+    return "dub" if _is_dub(group) else "subs"
+
+
 def _pick_group(groups: list[dict], audio: str, extended: bool) -> dict | None:
     """
     Choose the best group given audio preference and extended preference.
-    audio: 'subs' prefer subtitles, fallback to dub if unavailable
-           'dub'  prefer dub, fallback to subs if unavailable
+    audio: 'subs' subtitles over the original audio, 'dub' a dubbed track.
     extended: True  = prefer Extended Cut over regular when available
               False = prefer regular, ignore Extended Cut
     Alternate Cut (e.g. G-8) is never picked automatically.
-    Handles both Spanish labels (subtitulo/doblaje) and English labels (subtitle/dub).
+
+    There is no crossing over between the two: an arc the Spanish page only offers dubbed
+    returns nothing here, and the caller falls through to the English page for subtitles over
+    the same original audio. Taking the dub instead is how Water Seven ended up in Castilian.
     """
     def lower(g): return g["label"].lower()
-    is_subs     = lambda g: "subtitulo" in lower(g) or "subtitle" in lower(g)
-    is_dub      = lambda g: "doblaje" in lower(g) or ("dub" in lower(g) and "subtitle" not in lower(g))
     is_extended = lambda g: "extended cut" in lower(g)
     is_alternate = lambda g: "alternate cut" in lower(g)
     is_regular  = lambda g: not is_extended(g) and not is_alternate(g)
 
-    subs_groups = [g for g in groups if is_subs(g) and not is_alternate(g)]
-    dub_groups  = [g for g in groups if is_dub(g)]
-    primary     = subs_groups if audio == "subs" else dub_groups
-    secondary   = dub_groups  if audio == "subs" else subs_groups
-
-    def best(candidates):
-        if not candidates:
-            return None
-        if extended:
-            return next(
-                (g for g in candidates if is_extended(g)),
-                next((g for g in candidates if is_regular(g)), candidates[0]),
-            )
-        return next((g for g in candidates if is_regular(g)), candidates[0])
-
-    return best(primary) or best(secondary)
+    wanted = _is_dub if audio == "dub" else _is_subs
+    candidates = [g for g in groups if wanted(g) and not is_alternate(g)]
+    if not candidates:
+        return None
+    if extended:
+        return next(
+            (g for g in candidates if is_extended(g)),
+            next((g for g in candidates if is_regular(g)), candidates[0]),
+        )
+    return next((g for g in candidates if is_regular(g)), candidates[0])
 
 
 def _pick_resolution(links: dict, resolution: str) -> tuple[str, str] | None:
@@ -267,6 +300,7 @@ def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple
             "title": title,
             "resolution": chosen_res,
             "variant": group["label"],
+            "kind": _kind(group),
             "pd_list_id": chosen_url.rstrip("/").split("/")[-1],
             "pd_url": chosen_url,
         }
@@ -299,6 +333,7 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
         entry = dict(arc)
         entry["season"] = season_num
         entry["lang"] = "en" if arc_id in en_only else "es"
+        entry["marker"] = f"{entry['lang']}-{entry['kind']}"
         entry["available_es"] = "1" if arc_id in es_arcs else "0"
         entry["available_en"] = "1" if arc_id in en_arcs else "0"
         if arc_id in en_only:
@@ -639,7 +674,9 @@ def main() -> None:
     parser.add_argument(
         "--audio", default="subs",
         choices=["subs", "dub"],
-        help="Audio preference: subs=subtitles/subtitulos, dub=dub/doblaje (default: subs)",
+        help="What to take: subs=original audio with subtitles, dub=a dubbed track. "
+             "Never crosses over, so 'subs' falls back to English subtitles rather than "
+             "to a Spanish dub (default: subs)",
     )
     parser.add_argument(
         "--no-extended", dest="extended", action="store_false", default=True,
@@ -735,12 +772,12 @@ def main() -> None:
 
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
-        arc_lang = arc["lang"]
 
-        stored_lang = _read_lang_marker(season_dir)
-        if stored_lang == "en" and arc_lang == "es":
-            print(f"\n[upgrade] S{arc['season']:02d} {arc['title']}: ES now available, replacing EN files")
-            _upgrade_season_to_es(season_dir, args.dry_run)
+        stored = _read_lang_marker(season_dir)
+        if _needs_replacing(stored, arc["marker"]):
+            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: on disk as "
+                  f"{stored}, wanted as {arc['marker']}")
+            _clear_season(season_dir, f"{stored} replaced by {arc['marker']}", args.dry_run)
 
         print(f"\n=== S{arc['season']:02d} {arc['title']} [{arc['resolution']}] — {arc['variant']} ===")
         print(f"    pixeldrain folder: {arc['pd_list_id']}")
@@ -787,7 +824,7 @@ def main() -> None:
                         stats["failed"] += 1
 
         if not args.dry_run:
-            _write_lang_marker(season_dir, arc_lang)
+            _write_lang_marker(season_dir, arc["marker"])
             push_arc_metrics(args.pushgateway, arcs, show_dir)
 
         arc_new = stats["downloaded"] - stats.get("_prev_downloaded", 0)
