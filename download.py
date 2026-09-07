@@ -153,16 +153,20 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path,
     variants: list[str] = ["# TYPE onepace_arc_files_on_disk gauge"]
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
-        videos = ([f for f in season_dir.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES]
-                  if season_dir.exists() else [])
-        lang_on_disk, _ = _marker_parts(_read_lang_marker(season_dir))
+        videos = _season_videos(season_dir)
+        stored = _read_lang_marker(season_dir)
+        lang_on_disk, _ = _marker_parts(stored)
         counts = collections.Counter(_variant_from_name(f.name) for f in videos)
+        # Counting the dub versions here would inflate the episode count and read as
+        # "mixed"; they are the same episodes again, and show up per pair below.
+        main = _main_videos(season_dir, stored or arc["marker"])
+        main_counts = collections.Counter(_variant_from_name(f.name) for f in main)
         arc_labels = (
             f'arc_id="{_escape_label(arc["arc_id"])}",'
             f'title="{_escape_label(arc["title"])}",'
             f'season="{arc["season"]:02d}"'
         )
-        audio, subtitles = _season_variant(counts)
+        audio, subtitles = _season_variant(main_counts)
         if canon_keys is None:
             is_canon = "unknown"
         else:
@@ -175,7 +179,7 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path,
             f'audio="{audio}",subtitles="{subtitles}",'
             f'canon="{is_canon}"'
         )
-        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {len(videos)}")
+        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {len(main)}")
 
         # Also per audio/subtitle pair, which the season labels above cannot express: a
         # season part-way through a replacement holds both, and reads "mixed" up there.
@@ -243,17 +247,38 @@ def _marker_variant(marker: str) -> tuple[str, str]:
     return "original", language or "unknown"
 
 
+def _is_companion(variant: tuple[str, str], marker: str) -> bool:
+    """True for a dub sitting in a season that was taken with subtitles, which is a second
+    Plex version of those episodes and not a season that came down in the wrong language."""
+    _, subtitles = variant
+    marker_audio, _ = _marker_variant(marker)
+    return subtitles == "none" and marker_audio == "original"
+
+
+def _main_videos(season_dir: Path, marker: str) -> list[Path]:
+    """The season's own episodes, without the dub versions kept alongside them."""
+    return [f for f in _season_videos(season_dir)
+            if not _is_companion(_variant_from_name(f.name), marker)]
+
+
 def _disk_disagrees(season_dir: Path, marker: str) -> tuple[str, str] | None:
     """The (audio, subtitles) actually on disk when it is not what `marker` asks for.
 
     A marker can be right about the past and wrong about the present: a run that replaced
     half a season and died, or one that wrote the marker before an older file was removed.
     Files nobody can classify are left alone rather than replaced on every pass forever.
+    Dub files alongside a subtitled season are second versions and say nothing about
+    whether the season itself is right; a season holding nothing else still does.
     """
     counts = collections.Counter(_variant_from_name(f.name) for f in _season_videos(season_dir))
     if not counts:
         return None
-    found = _season_variant(counts)
+    main = collections.Counter(
+        {v: n for v, n in counts.items() if not _is_companion(v, marker)}
+    )
+    if not main:
+        return _season_variant(counts)
+    found = _season_variant(main)
     if found == ("unknown", "unknown") or found == _marker_variant(marker):
         return None
     return found
@@ -343,6 +368,12 @@ def _is_dub(group: dict) -> bool:
     return "doblaje" in label or ("dub" in label and "subtitle" not in label)
 
 
+def _is_spanish_dub(group: dict) -> bool:
+    """The Spanish page calls it "Doblaje en español"; the English one only ever offers an
+    "English Dub", which is no use as a second version here."""
+    return "doblaje" in group["label"].lower()
+
+
 def _kind(group: dict) -> str:
     return "dub" if _is_dub(group) else "subs"
 
@@ -381,11 +412,28 @@ def _pick_resolution(links: dict, resolution: str) -> tuple[str, str] | None:
     return None
 
 
-def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple[list[str], dict[str, dict]]:
+def _pick_dub_resolution(links: dict, main_resolution: str) -> tuple[str, str] | None:
+    """The best dub resolution that is not sharper than the main version's.
+
+    Plex orders the versions of an episode by resolution and plays the first one, so a
+    1080p dub next to a 720p subtitled file is what a click on play gives you. At equal
+    resolution it keeps the one that was already there, which is the subtitled file. Only
+    a Spanish-subtitled season needs holding back like this: it is what should play.
+    """
+    for res in RESOLUTIONS[RESOLUTIONS.index(main_resolution):]:
+        if res in links:
+            return res, links[res]
+    return None
+
+
+def _scrape_page(url: str, resolution: str, audio: str,
+                 extended: bool) -> tuple[list[str], dict[str, dict], dict[str, dict]]:
     """
     Scrape a onepace.net watch page.
-    Returns (ordered_arc_ids, resolved_arcs) where resolved_arcs maps arc_id -> arc dict
-    for arcs that have downloadable content matching the given preferences.
+    Returns (ordered_arc_ids, resolved_arcs, spanish_dubs) where resolved_arcs maps
+    arc_id -> arc dict for arcs that have downloadable content matching the given
+    preferences, and spanish_dubs maps arc_id -> the Spanish dub group, whether or not the
+    preferences asked for it.
     """
     print(f"Fetching {url} ...")
     resp = requests.get(url, headers=HEADERS, timeout=30)
@@ -399,6 +447,7 @@ def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple
 
     ordered_ids = [li["id"] for li in arc_lis]
     resolved: dict[str, dict] = {}
+    spanish_dubs: dict[str, dict] = {}
 
     for li in arc_lis:
         arc_id = li["id"]
@@ -408,6 +457,12 @@ def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple
         groups = _parse_arc_groups(li)
         if not groups:
             continue
+
+        # Kept before the pick below drops it: an arc offered only as a dub resolves to
+        # nothing here, and that is exactly the arc a second version is for.
+        dub_group = next((g for g in groups if _is_spanish_dub(g)), None)
+        if dub_group:
+            spanish_dubs[arc_id] = dub_group
 
         group = _pick_group(groups, audio, extended)
         if not group:
@@ -428,17 +483,20 @@ def _scrape_page(url: str, resolution: str, audio: str, extended: bool) -> tuple
             "pd_url": chosen_url,
         }
 
-    return ordered_ids, resolved
+    return ordered_ids, resolved, spanish_dubs
 
 
-def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> list[dict]:
+def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True,
+               dub_version: bool = True) -> list[dict]:
     """
     Scrape ES page first; fall back to EN for any arc not available in Spanish.
     Season numbers reflect each arc's position in the merged ordered list,
     so they remain stable as new arcs are added to either page.
+    dub_version: attach the Spanish dub of an arc taken with subtitles, to be downloaded
+    alongside it as a second Plex version rather than instead of it.
     """
-    es_ordered, es_arcs = _scrape_page(ONEPACE_URL_ES, resolution, audio, extended)
-    en_ordered, en_arcs = _scrape_page(ONEPACE_URL_EN, resolution, audio, extended)
+    es_ordered, es_arcs, es_dubs = _scrape_page(ONEPACE_URL_ES, resolution, audio, extended)
+    en_ordered, en_arcs, _ = _scrape_page(ONEPACE_URL_EN, resolution, audio, extended)
 
     # Merge ordering: ES arcs first (preserving their positions), then any EN-only arcs
     seen = set(es_ordered)
@@ -461,6 +519,21 @@ def fetch_arcs(resolution: str, audio: str = "subs", extended: bool = True) -> l
         entry["available_en"] = "1" if arc_id in en_arcs else "0"
         if arc_id in en_only:
             entry["variant"] = f"{entry['variant']} [EN]"
+        if dub_version and entry["kind"] != "dub" and arc_id in es_dubs:
+            dub = es_dubs[arc_id]
+            # Spanish subtitles over the original audio is what should play, so a dub is
+            # held below them. Nothing to protect where the subtitles are English anyway.
+            if entry["marker"] == "es-subs":
+                pick = _pick_dub_resolution(dub["links"], entry["resolution"])
+            else:
+                pick = _pick_resolution(dub["links"], resolution)
+            if pick:
+                dub_res, dub_url = pick
+                entry["dub"] = {
+                    "resolution": dub_res,
+                    "variant": dub["label"],
+                    "pd_list_id": dub_url.rstrip("/").split("/")[-1],
+                }
         arcs.append(entry)
 
     return arcs
@@ -787,6 +860,48 @@ def write_tvshow_nfo(show_dir: Path, dry_run: bool = False) -> None:
         print(f"[meta] tvshow.nfo written (fallback)")
 
 
+def download_dub_version(arc: dict, season_dir: Path, stats: dict, dry_run: bool) -> None:
+    """Download the Spanish dub of an arc taken with subtitles, into the same season.
+
+    Only the episodes the dub has. One Pace dubs an arc long after it subtitles it, so five
+    dubbed episodes beside twenty subtitled ones is the normal state of an arc, not a
+    download that stopped half way.
+    """
+    dub = arc["dub"]
+    print(f"  --- also {dub['variant']} [{dub['resolution']}] as a second version ---")
+    print(f"      pixeldrain folder: {dub['pd_list_id']}")
+    try:
+        files = [f for f in list_pd_folder(dub["pd_list_id"])
+                 if Path(f["name"]).suffix.lower() in VIDEO_SUFFIXES]
+    except Exception as exc:
+        print(f"  [err] Could not list dub folder {dub['pd_list_id']}: {exc}")
+        return
+
+    if not files:
+        print("  [warn] Empty dub folder")
+        return
+
+    print(f"  {len(files)} dubbed file(s) available")
+    if dry_run:
+        for f in files:
+            download_file(f["id"], season_dir / f["name"], dry_run=True)
+        return
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(download_file, f["id"], season_dir / f["name"]): f
+            for f in files
+        }
+        for future in as_completed(futures):
+            dest = season_dir / futures[future]["name"]
+            if future.result():
+                stats["downloaded"] += 1
+            elif dest.exists():
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One Pace Jellyfin downloader")
     parser.add_argument(
@@ -804,6 +919,11 @@ def main() -> None:
     parser.add_argument(
         "--no-extended", dest="extended", action="store_false", default=True,
         help="Skip Extended Cut even when available (default: prefer Extended Cut)",
+    )
+    parser.add_argument(
+        "--no-dub-version", dest="dub_version", action="store_false", default=True,
+        help="Skip the Spanish dub kept alongside a subtitled season as a second Plex "
+             "version (default: download it for the episodes that have one)",
     )
     parser.add_argument(
         "--output", default="/mnt/data/series",
@@ -858,7 +978,8 @@ def main() -> None:
         print("[warn] Both --plex-url and --plex-token are required for Plex sync")
 
     check_connectivity()
-    arcs = fetch_arcs(args.resolution, audio=args.audio, extended=args.extended)
+    arcs = fetch_arcs(args.resolution, audio=args.audio, extended=args.extended,
+                      dub_version=args.dub_version)
     canon_arcs = fetch_canon_arcs()
 
     official_seasons: dict[str, int] = {}
@@ -873,7 +994,10 @@ def main() -> None:
         print(f"\n{'S#':>4}  {'Arc ID':<35} {'Title':<30} {'Res':<6} {'Variant'}")
         print("-" * 100)
         for arc in arcs:
-            print(f"S{arc['season']:02d}   {arc['arc_id']:<35} {arc['title']:<30} {arc['resolution']:<6} {arc['variant']}")
+            dub = arc.get("dub")
+            extra = f"  (+ {dub['variant']} {dub['resolution']})" if dub else ""
+            print(f"S{arc['season']:02d}   {arc['arc_id']:<35} {arc['title']:<30} "
+                  f"{arc['resolution']:<6} {arc['variant']}{extra}")
         return
 
     if args.arc:
@@ -927,7 +1051,7 @@ def main() -> None:
         # of an arc still in progress publishes one episode where the English side has five.
         stored = _read_lang_marker(season_dir)
         disagrees = _disk_disagrees(season_dir, arc["marker"])
-        on_disk = len(_season_videos(season_dir))
+        on_disk = len(_main_videos(season_dir, arc["marker"]))
         wants_replacing = _needs_replacing(stored, arc["marker"]) or disagrees
         if wants_replacing and len(files) < on_disk:
             print(f"  [keep]  {on_disk} file(s) on disk, this source has only "
@@ -960,6 +1084,9 @@ def main() -> None:
                         stats["skipped"] += 1
                     else:
                         stats["failed"] += 1
+
+        if arc.get("dub"):
+            download_dub_version(arc, season_dir, stats, args.dry_run)
 
         if not args.dry_run:
             _write_lang_marker(season_dir, arc["marker"])
