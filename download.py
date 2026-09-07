@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import collections
 import re
 import socket
 import sys
@@ -37,6 +38,8 @@ RESOLUTIONS = ["1080p", "720p", "480p"]
 # read it. Only video files were ever wanted.
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".m4v"}
 LANG_MARKER = ".lang"
+# Every release names its variant in the filename: [Es Sub], [En Sub], [Es Dub].
+VARIANT_IN_NAME = re.compile(r"\[(Es|En) (Sub|Dub)\]", re.IGNORECASE)
 
 HEADERS = {
     "User-Agent": (
@@ -44,6 +47,18 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+def _variant_from_name(name: str) -> tuple[str, str]:
+    """(audio, subtitles) for one file, read off its name rather than off the marker: the
+    marker is what the script meant to fetch, the name is what is actually on disk."""
+    match = VARIANT_IN_NAME.search(name)
+    if not match:
+        return "unknown", "unknown"
+    language, kind = match.group(1).lower(), match.group(2).lower()
+    if kind == "dub":
+        return language, "none"
+    return "original", language
 
 
 def _escape_label(v: str) -> str:
@@ -85,21 +100,35 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
     if not pgw_url:
         return
     lines = ["# TYPE onepace_arc_episodes_on_disk gauge"]
+    variants: list[str] = ["# TYPE onepace_arc_files_on_disk gauge"]
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
-        on_disk = len(list(season_dir.glob("*.mkv")) + list(season_dir.glob("*.mp4"))) if season_dir.exists() else 0
+        videos = ([f for f in season_dir.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES]
+                  if season_dir.exists() else [])
         lang_on_disk, variant_on_disk = _marker_parts(_read_lang_marker(season_dir))
-        labels = (
+        arc_labels = (
             f'arc_id="{_escape_label(arc["arc_id"])}",'
             f'title="{_escape_label(arc["title"])}",'
-            f'season="{arc["season"]:02d}",'
+            f'season="{arc["season"]:02d}"'
+        )
+        labels = (
+            f'{arc_labels},'
             f'available_es="{arc["available_es"]}",'
             f'available_en="{arc["available_en"]}",'
             f'lang="{lang_on_disk or "none"}",'
             f'variant="{variant_on_disk or "unknown"}"'
         )
-        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {on_disk}")
-    payload = "\n".join(lines) + "\n"
+        lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {len(videos)}")
+
+        # Per audio/subtitle pair rather than per season: a season part-way through a
+        # replacement holds both, and collapsing that hides the half that is wrong.
+        counts = collections.Counter(_variant_from_name(f.name) for f in videos)
+        for (audio, subtitles), count in sorted(counts.items()):
+            variants.append(
+                f'onepace_arc_files_on_disk{{{arc_labels},'
+                f'audio="{audio}",subtitles="{subtitles}"}} {count}'
+            )
+    payload = "\n".join(lines + variants) + "\n"
     try:
         requests.post(
             f"{pgw_url.rstrip('/')}/metrics/job/one-pace-downloader/type/arc-status",
