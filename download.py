@@ -16,6 +16,7 @@ import argparse
 import collections
 import re
 import socket
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,6 +54,11 @@ ARC_ALIASES = {
 }
 # Every release names its variant in the filename: [Es Sub], [En Sub], [Es Dub].
 VARIANT_IN_NAME = re.compile(r"\[(Es|En) (Sub|Dub)\]", re.IGNORECASE)
+# The audio language a file should declare, by the audio its name implies. One Pace sets it
+# on some releases and leaves it unset on others: of 72 files holding two versions of an
+# episode, 42 declared nothing and Plex showed "Unknown" for both, which is the one place
+# the language is worth reading, since it is what tells the two versions apart.
+AUDIO_LANGUAGES = {"original": "jpn", "es": "spa", "en": "eng"}
 
 HEADERS = {
     "User-Agent": (
@@ -259,6 +265,108 @@ def _main_videos(season_dir: Path, marker: str) -> list[Path]:
     """The season's own episodes, without the dub versions kept alongside them."""
     return [f for f in _season_videos(season_dir)
             if not _is_companion(_variant_from_name(f.name), marker)]
+
+
+def _pack_language(code: str) -> bytes:
+    """ISO-639-2 as mp4 packs it: three 5-bit letters, each offset from 0x60."""
+    return struct.pack(">H", sum((ord(c) - 0x60) << s for c, s in zip(code, (10, 5, 0))))
+
+
+def _unpack_language(raw: bytes) -> str:
+    value = struct.unpack(">H", raw)[0]
+    return "".join(chr(((value >> s) & 0x1F) + 0x60) for s in (10, 5, 0))
+
+
+def _mp4_boxes(fh, start: int, end: int):
+    """Yield (type, payload_start, box_end) for the mp4 boxes between two offsets."""
+    pos = start
+    while pos + 8 <= end:
+        fh.seek(pos)
+        header = fh.read(8)
+        if len(header) < 8:
+            return
+        size = struct.unpack(">I", header[:4])[0]
+        box_type = header[4:8].decode("latin1")
+        payload = pos + 8
+        if size == 1:
+            size = struct.unpack(">Q", fh.read(8))[0]
+            payload = pos + 16
+        elif size == 0:
+            size = end - pos
+        if size < 8:
+            return
+        yield box_type, payload, pos + size
+        pos += size
+
+
+def _find_mp4_box(fh, start: int, end: int, wanted: str):
+    for box_type, payload, box_end in _mp4_boxes(fh, start, end):
+        if box_type == wanted:
+            return payload, box_end
+    return None
+
+
+def _audio_language_offset(fh, size: int) -> int | None:
+    """File offset of the language field in the audio track's mdhd box."""
+    moov = _find_mp4_box(fh, 0, size, "moov")
+    if not moov:
+        return None
+    for box_type, trak_start, trak_end in _mp4_boxes(fh, *moov):
+        if box_type != "trak":
+            continue
+        mdia = _find_mp4_box(fh, trak_start, trak_end, "mdia")
+        if not mdia:
+            continue
+        hdlr = _find_mp4_box(fh, *mdia, "hdlr")
+        mdhd = _find_mp4_box(fh, *mdia, "mdhd")
+        if not hdlr or not mdhd:
+            continue
+        fh.seek(hdlr[0] + 8)
+        if fh.read(4) != b"soun":
+            continue
+        fh.seek(mdhd[0])
+        version = fh.read(1)[0]
+        # The times before the language field are 32-bit in version 0 and 64-bit in version 1
+        return mdhd[0] + (20 if version == 0 else 32)
+    return None
+
+
+def _set_audio_language(path: Path, code: str, dry_run: bool) -> bool:
+    """Write the audio track's language, in place, if it is not already `code`. Two bytes in
+    the mdhd box, so no re-encoding and no track is touched. Returns True if it changed."""
+    with open(path, "rb" if dry_run else "r+b") as fh:
+        offset = _audio_language_offset(fh, path.stat().st_size)
+        if offset is None:
+            return False
+        fh.seek(offset)
+        if _unpack_language(fh.read(2)) == code:
+            return False
+        if not dry_run:
+            fh.seek(offset)
+            fh.write(_pack_language(code))
+    return True
+
+
+def tag_season_audio(season_dir: Path, dry_run: bool = False) -> int:
+    """Make every file in the season declare the audio language its name implies, so Plex
+    names the audio of each version instead of showing "Unknown". Returns how many changed.
+
+    Plex builds the label in its version picker out of bitrate and resolution alone, and
+    there is no field to name a version, so the audio language is what identifies which of
+    two versions of an episode you are looking at.
+    """
+    changed = 0
+    for video in _season_videos(season_dir):
+        code = AUDIO_LANGUAGES.get(_variant_from_name(video.name)[0])
+        if not code or video.suffix.lower() != ".mp4":
+            continue
+        try:
+            if _set_audio_language(video, code, dry_run):
+                print(f"  [{'dry' if dry_run else 'lang'}]  {video.name}: audio -> {code}")
+                changed += 1
+        except Exception as exc:
+            print(f"  [warn] Could not tag {video.name}: {exc}")
+    return changed
 
 
 def _disk_disagrees(season_dir: Path, marker: str) -> tuple[str, str] | None:
@@ -639,6 +747,20 @@ class PlexClient:
                 return None
         return self._season_keys.get(season_num)
 
+    def analyze_season(self, season_num: int, show_title: str) -> None:
+        """Make Plex re-read the media it already has. Writing an audio language does not
+        change a file's size, so a scan on its own leaves the old streams in place."""
+        key = self._season_key(season_num, show_title)
+        if not key:
+            return
+        try:
+            r = requests.put(f"{self._url}/library/metadata/{key}/analyze",
+                             headers=self._headers(), timeout=30)
+            r.raise_for_status()
+            print(f"  [plex] S{season_num:02d} re-analyzed")
+        except Exception as exc:
+            print(f"  [plex] Could not re-analyze S{season_num:02d}: {exc}")
+
     def sync_season(self, season_num: int, season_dir: Path, show_title: str) -> None:
         key = self._season_key(season_num, show_title)
         if not key:
@@ -871,17 +993,23 @@ def download_dub_version(arc: dict, season_dir: Path, stats: dict, dry_run: bool
     print(f"  --- also {dub['variant']} [{dub['resolution']}] as a second version ---")
     print(f"      pixeldrain folder: {dub['pd_list_id']}")
     try:
-        files = [f for f in list_pd_folder(dub["pd_list_id"])
-                 if Path(f["name"]).suffix.lower() in VIDEO_SUFFIXES]
+        videos = [f for f in list_pd_folder(dub["pd_list_id"])
+                  if Path(f["name"]).suffix.lower() in VIDEO_SUFFIXES]
     except Exception as exc:
         print(f"  [err] Could not list dub folder {dub['pd_list_id']}: {exc}")
         return
 
+    # A dub folder is padded out to the length of the arc with the subtitled release, the
+    # same pixeldrain file under the same name. Baratie publishes eight files that way and
+    # only the first is dubbed. Taking them would put the season's own episodes in twice.
+    files = [f for f in videos if _variant_from_name(f["name"])[1] == "none"]
     if not files:
-        print("  [warn] Empty dub folder")
+        print("  [warn] Nothing dubbed in the dub folder")
         return
 
-    print(f"  {len(files)} dubbed file(s) available")
+    padding = len(videos) - len(files)
+    print(f"  {len(files)} dubbed file(s) available"
+          + (f", {padding} not dubbed and left alone" if padding else ""))
     if dry_run:
         for f in files:
             download_file(f["id"], season_dir / f["name"], dry_run=True)
@@ -924,6 +1052,11 @@ def main() -> None:
         "--no-dub-version", dest="dub_version", action="store_false", default=True,
         help="Skip the Spanish dub kept alongside a subtitled season as a second Plex "
              "version (default: download it for the episodes that have one)",
+    )
+    parser.add_argument(
+        "--no-audio-language", dest="audio_language", action="store_false", default=True,
+        help="Leave the audio language of the files alone (default: write the language "
+             "each file's name implies, so Plex names the audio instead of 'Unknown')",
     )
     parser.add_argument(
         "--output", default="/mnt/data/series",
@@ -1088,6 +1221,8 @@ def main() -> None:
         if arc.get("dub"):
             download_dub_version(arc, season_dir, stats, args.dry_run)
 
+        tagged = tag_season_audio(season_dir, args.dry_run) if args.audio_language else 0
+
         if not args.dry_run:
             _write_lang_marker(season_dir, arc["marker"])
             push_arc_metrics(args.pushgateway, arcs, show_dir, canon_arcs)
@@ -1102,6 +1237,9 @@ def main() -> None:
         if plex and not args.dry_run and (arc_new > 0 or wrote_meta):
             plex.sync_season(arc["season"], season_dir, SHOW_DIR_NAME)
             plex.sync_episodes(arc["season"], season_dir, SHOW_DIR_NAME)
+
+        if plex and not args.dry_run and tagged:
+            plex.analyze_season(arc["season"], SHOW_DIR_NAME)
 
         stats["arcs_done"] += 1
         push_metrics(args.pushgateway, stats)
