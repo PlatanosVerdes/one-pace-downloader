@@ -61,6 +61,15 @@ def _variant_from_name(name: str) -> tuple[str, str]:
     return "original", language
 
 
+def _season_variant(counts: collections.Counter) -> tuple[str, str]:
+    """One (audio, subtitles) pair for a whole season, for the per-season metric."""
+    if not counts:
+        return "none", "none"
+    if len(counts) > 1:
+        return "mixed", "mixed"
+    return next(iter(counts))
+
+
 def _escape_label(v: str) -> str:
     return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
@@ -105,24 +114,25 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
         season_dir = show_dir / f"Season {arc['season']:02d}"
         videos = ([f for f in season_dir.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES]
                   if season_dir.exists() else [])
-        lang_on_disk, variant_on_disk = _marker_parts(_read_lang_marker(season_dir))
+        lang_on_disk, _ = _marker_parts(_read_lang_marker(season_dir))
+        counts = collections.Counter(_variant_from_name(f.name) for f in videos)
         arc_labels = (
             f'arc_id="{_escape_label(arc["arc_id"])}",'
             f'title="{_escape_label(arc["title"])}",'
             f'season="{arc["season"]:02d}"'
         )
+        audio, subtitles = _season_variant(counts)
         labels = (
             f'{arc_labels},'
             f'available_es="{arc["available_es"]}",'
             f'available_en="{arc["available_en"]}",'
             f'lang="{lang_on_disk or "none"}",'
-            f'variant="{variant_on_disk or "unknown"}"'
+            f'audio="{audio}",subtitles="{subtitles}"'
         )
         lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {len(videos)}")
 
-        # Per audio/subtitle pair rather than per season: a season part-way through a
-        # replacement holds both, and collapsing that hides the half that is wrong.
-        counts = collections.Counter(_variant_from_name(f.name) for f in videos)
+        # Also per audio/subtitle pair, which the season labels above cannot express: a
+        # season part-way through a replacement holds both, and reads "mixed" up there.
         for (audio, subtitles), count in sorted(counts.items()):
             variants.append(
                 f'onepace_arc_files_on_disk{{{arc_labels},'

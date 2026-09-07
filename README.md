@@ -139,12 +139,14 @@ If you run a Prometheus Pushgateway, pass `--pushgateway http://pushgateway:9091
 - `onepace_last_run_seconds`
 
 **Per arc** (pushed to `/type/arc-status` grouping key):
-- `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang, variant}`
+- `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang, audio, subtitles}`
 - `onepace_arc_files_on_disk{arc_id, title, season, audio, subtitles}`
 
-The first powers the Arc Status table in Grafana, showing which arcs are available in Spanish/English and what the marker says is on disk.
+The first is one series per season and powers the Arc Status table in Grafana. A season holding more than one variant, which happens part-way through a replacement, reads `mixed`; an empty one reads `none`.
 
-The second reports what the files themselves say, one series per audio/subtitle pair, so a season part-way through a replacement shows both halves:
+The second is one series per audio/subtitle pair, which is what a `mixed` season needs to be readable: it shows both halves separately.
+
+In both, `audio` and `subtitles` come from the filename:
 
 | filename tag | `audio` | `subtitles` |
 |---|---|---|
@@ -153,7 +155,7 @@ The second reports what the files themselves say, one series per audio/subtitle 
 | `[Es Dub]` | `es` | `none` |
 | no tag | `unknown` | `unknown` |
 
-Both labels come off the filename, not off the `.lang` marker: the marker records what a run meant to fetch, the filename records what it got, and the two can disagree. `sum(onepace_arc_files_on_disk{audio!="original"})` is therefore the count of episodes that are actually dubbed, whatever the markers claim, and it should be zero.
+`lang` still comes off the `.lang` marker, so it records what a run meant to fetch while `audio` and `subtitles` record what it got. The two disagreeing is worth looking at. `sum(onepace_arc_files_on_disk{audio!="original"})` is the count of episodes actually dubbed, whatever the markers claim, and it should be zero.
 
 ---
 
