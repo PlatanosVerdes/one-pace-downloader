@@ -14,7 +14,7 @@ Inspired by [one-pace-for-plex](https://github.com/SpykerNZ/one-pace-for-plex) b
 
 1. Scrapes `onepace.net/es/watch` (Spanish) first.
 2. For any arc not yet available in Spanish, falls back to `onepace.net/en/watch` automatically. Affected arcs are logged and tagged `[EN]` in the output.
-3. After each download, writes a `.lang` marker per season (`es-subs`, `en-subs`, `es-dub`). On subsequent runs a season is deleted and re-downloaded when either its marker or its actual files stop matching what the preferences ask for. The marker catches an arc reaching the Spanish page, or one that has to stop using what it was taking before. The files catch what the marker cannot: a run that replaced half a season and died, or one that wrote the marker before an older file was removed. Files whose variant cannot be read from the name are left alone rather than replaced on every pass forever.
+3. After each download, writes a `.lang` marker per season (`es-subs`, `en-subs`, `es-dub`). On subsequent runs a season is deleted and re-downloaded when either its marker or its actual files stop matching what the preferences ask for. The marker catches an arc reaching the Spanish page, or one that has to stop using what it was taking before. The files catch what the marker cannot: a run that replaced half a season and died, or one that wrote the marker before an older file was removed. Files whose variant cannot be read from the name are left alone rather than replaced on every pass forever, and so are the dub files kept as a second version, which say nothing about whether the season itself is right. A season holding nothing but dubbed files still does.
 
 ---
 
@@ -28,6 +28,18 @@ In order, and the first one that exists wins:
 A dubbed track is never taken as a fallback. Some arcs are offered on the Spanish page only as `Doblaje en español`, and treating that as "the Spanish version" is how a Castilian-audio Water Seven ended up in the library: an arc like that skips the Spanish page entirely and takes English subtitles over the same original audio.
 
 `--audio dub` reverses the preference, and is just as strict: it takes a dub or nothing.
+
+### The Spanish dub as a second version
+
+A dub is never a fallback, but it is worth having beside the subtitled files rather than instead of them. Plex reads two files of the same episode as two versions of it and offers both under *Play Version*, so a season plays either with Spanish audio or with the original audio and subtitles.
+
+It is downloaded for the episodes that have one, which is usually fewer than the arc holds: One Pace dubs an arc long after it subtitles it, so Water Seven is 20 subtitled episodes and 5 dubbed ones.
+
+What should play is the original audio with Spanish subtitles, and Plex orders the versions of an episode by resolution and plays the first. So in a season taken with Spanish subtitles the dub is held to that resolution or lower, never higher: at equal resolution Plex keeps the file that was already there, which is the subtitled one, and an arc publishing its dub only above it is skipped. A season taken with English subtitles has nothing to protect, so there the dub is taken at `--resolution` like anything else and may well be what a click on play gives you.
+
+Neither version costs the server any transcoding: both are h264 with AAC stereo, and the subtitles are burnt into the subtitled release, so there is nothing to convert or to burn in on the fly. It is a version change and not an audio-track change, because the two files are separate encodes, and the dub carries no subtitles at all.
+
+`--no-dub-version` turns this off. Dub files already on disk are left where they are.
 
 ---
 
@@ -58,6 +70,7 @@ python3 download.py --resolution 1080p --output /your/media/series
 | `--resolution` | `1080p` | Preferred resolution (`1080p`, `720p`, `480p`). Falls back to next best if unavailable. |
 | `--audio` | `subs` | `subs` = original audio with subtitles, `dub` = a dubbed track. The two never cross over: see [Which version is taken](#which-version-is-taken) |
 | `--no-extended` | *(off)* | Skip Extended Cut even when available (default: prefer it) |
+| `--no-dub-version` | *(off)* | Skip the Spanish dub kept beside a subtitled season as a second Plex version: see [The Spanish dub as a second version](#the-spanish-dub-as-a-second-version) |
 | `--output` | `/mnt/data/series` | Root media directory |
 | `--dry-run` | *(off)* | Print what would be downloaded without downloading anything |
 | `--arc <id>` | *(all)* | Download a specific arc + the next one (e.g. `--arc skypiea`) |
@@ -92,6 +105,7 @@ Episodes are saved as:
 └── One Pace/
     ├── Season 01/       <- Romance Dawn
     │   ├── .lang        <- "es-subs", "en-subs" or "es-dub" (replacement marker)
+    │   ├── *[Es Dub]*   <- second version, only for the episodes that have a dub
     │   └── *.mp4
     ├── Season 02/       <- Orange Town
     └── ...
@@ -125,6 +139,8 @@ If Plex runs in a separate container where the media is mounted at a different p
 
 > The Plex library must have **Local Media Assets** enabled (it is by default). The `--plex-url` and `--plex-token` flags are both required for sync to activate; omitting either silently skips Plex integration.
 
+A dub downloaded as a second version appears once Plex has scanned the season, which it does on its own if the library watches the folder. `PUT /library/metadata/<season key>/refresh` forces it.
+
 ---
 
 ## Metrics
@@ -143,9 +159,9 @@ If you run a Prometheus Pushgateway, pass `--pushgateway http://pushgateway:9091
 - `onepace_arc_files_on_disk{arc_id, title, season, audio, subtitles}`
 - `onepace_canon_arcs_total`, `onepace_canon_arcs_covered`, `onepace_canon_arc_missing{title}`
 
-The first is one series per season and powers the Arc Status table in Grafana. A season holding more than one variant, which happens part-way through a replacement, reads `mixed`; an empty one reads `none`.
+The first is one series per season and powers the Arc Status table in Grafana. It counts and describes the season's own episodes, so a dub kept as a second version of some of them neither inflates the count nor turns the season `mixed`. A season holding more than one variant of its own episodes, which happens part-way through a replacement, reads `mixed`; an empty one reads `none`.
 
-The second is one series per audio/subtitle pair, which is what a `mixed` season needs to be readable: it shows both halves separately.
+The second is one series per audio/subtitle pair over every file on disk, dub versions included, which is what a `mixed` season needs to be readable: it shows both halves separately.
 
 In both, `audio` and `subtitles` come from the filename:
 
@@ -171,7 +187,7 @@ When the wiki cannot be reached the coverage metrics are not pushed at all, so t
 
 ---
 
-`lang` still comes off the `.lang` marker, so it records what a run meant to fetch while `audio` and `subtitles` record what it got. The two disagreeing is worth looking at. `sum(onepace_arc_files_on_disk{audio!="original"})` is the count of episodes actually dubbed, whatever the markers claim, and it should be zero.
+`lang` still comes off the `.lang` marker, so it records what a run meant to fetch while `audio` and `subtitles` record what it got. The two disagreeing is worth looking at. `sum(onepace_arc_files_on_disk{audio!="original"})` is the count of dubbed files on disk, whatever the markers claim; with second versions in the library it is no longer expected to be zero, so what says a season came down dubbed is `onepace_arc_episodes_on_disk{audio!="original"}`, which describes the season itself and should be empty unless the run asked for `--audio dub`.
 
 ---
 
