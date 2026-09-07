@@ -38,6 +38,19 @@ RESOLUTIONS = ["1080p", "720p", "480p"]
 # read it. Only video files were ever wanted.
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".m4v"}
 LANG_MARKER = ".lang"
+# One Pace publishes what it has finished, not what the manga contains, so the list of arcs
+# that exist has to come from somewhere else. The wiki separates story arcs from filler, which
+# matters: One Pace adapts the manga and never touches anime filler.
+WIKI_API = "https://onepiece.fandom.com/api.php"
+STORY_ARCS_CATEGORY = "Category:Story Arcs"
+# The wiki and One Pace romanise a handful of arcs differently. Without these the coverage
+# report claims arcs are missing that are sitting on disk.
+ARC_ALIASES = {
+    "arabasta": "alabasta",
+    "water7": "waterseven",
+    "wanocountry": "wano",
+    "levely": "reverie",
+}
 # Every release names its variant in the filename: [Es Sub], [En Sub], [Es Dub].
 VARIANT_IN_NAME = re.compile(r"\[(Es|En) (Sub|Dub)\]", re.IGNORECASE)
 
@@ -47,6 +60,32 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 }
+
+
+def _arc_key(name: str) -> str:
+    """A comparable key for an arc, from either a wiki title or a One Pace slug."""
+    key = re.sub(r"\s+arc$", "", name.strip(), flags=re.I).lower().replace("-", " ")
+    key = re.sub(r"[^a-z0-9]", "", key)
+    return ARC_ALIASES.get(key, key)
+
+
+def fetch_canon_arcs() -> list[str] | None:
+    """Titles of every story arc the manga has, or None when the wiki cannot be reached.
+
+    None rather than an empty list: nothing is worse than reporting that every arc is
+    missing because a lookup timed out.
+    """
+    params = {"action": "query", "list": "categorymembers", "cmtitle": STORY_ARCS_CATEGORY,
+              "cmtype": "page", "cmlimit": "500", "format": "json"}
+    try:
+        resp = requests.get(WIKI_API, params=params, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        members = resp.json()["query"]["categorymembers"]
+    except Exception as exc:
+        print(f"  [warn] canon arc list unavailable: {exc}")
+        return None
+    # The category also holds its own index page, which is not an arc.
+    return [m["title"] for m in members if m["title"].endswith(" Arc")]
 
 
 def _variant_from_name(name: str) -> tuple[str, str]:
@@ -104,10 +143,12 @@ def push_metrics(pgw_url: str, stats: dict) -> None:
         print(f"  [warn] Pushgateway unreachable: {exc}")
 
 
-def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
+def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path,
+                     canon: list[str] | None = None) -> None:
     """Push per-arc status metrics to Pushgateway under a separate grouping key."""
     if not pgw_url:
         return
+    canon_keys = {_arc_key(t): t for t in canon} if canon is not None else None
     lines = ["# TYPE onepace_arc_episodes_on_disk gauge"]
     variants: list[str] = ["# TYPE onepace_arc_files_on_disk gauge"]
     for arc in arcs:
@@ -122,12 +163,17 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
             f'season="{arc["season"]:02d}"'
         )
         audio, subtitles = _season_variant(counts)
+        if canon_keys is None:
+            is_canon = "unknown"
+        else:
+            is_canon = "true" if _arc_key(arc["arc_id"]) in canon_keys else "false"
         labels = (
             f'{arc_labels},'
             f'available_es="{arc["available_es"]}",'
             f'available_en="{arc["available_en"]}",'
             f'lang="{lang_on_disk or "none"}",'
-            f'audio="{audio}",subtitles="{subtitles}"'
+            f'audio="{audio}",subtitles="{subtitles}",'
+            f'canon="{is_canon}"'
         )
         lines.append(f"onepace_arc_episodes_on_disk{{{labels}}} {len(videos)}")
 
@@ -138,6 +184,20 @@ def push_arc_metrics(pgw_url: str, arcs: list[dict], show_dir: Path) -> None:
                 f'onepace_arc_files_on_disk{{{arc_labels},'
                 f'audio="{audio}",subtitles="{subtitles}"}} {count}'
             )
+    if canon_keys is not None:
+        covered = {_arc_key(a["arc_id"]) for a in arcs} & set(canon_keys)
+        lines.append("# HELP onepace_canon_arcs_total Story arcs the manga has, per the wiki\n"
+                     "# TYPE onepace_canon_arcs_total gauge\n"
+                     f"onepace_canon_arcs_total {len(canon_keys)}")
+        lines.append("# HELP onepace_canon_arcs_covered Story arcs One Pace has released\n"
+                     "# TYPE onepace_canon_arcs_covered gauge\n"
+                     f"onepace_canon_arcs_covered {len(covered)}")
+        lines.append("# HELP onepace_canon_arc_missing Story arc One Pace has not released\n"
+                     "# TYPE onepace_canon_arc_missing gauge")
+        for key, title in sorted(canon_keys.items(), key=lambda kv: kv[1]):
+            if key not in covered:
+                lines.append(f'onepace_canon_arc_missing{{title="{_escape_label(title)}"}} 1')
+
     payload = "\n".join(lines + variants) + "\n"
     try:
         requests.post(
@@ -799,6 +859,7 @@ def main() -> None:
 
     check_connectivity()
     arcs = fetch_arcs(args.resolution, audio=args.audio, extended=args.extended)
+    canon_arcs = fetch_canon_arcs()
 
     official_seasons: dict[str, int] = {}
     nfo_index: dict[tuple[int, int], str] = {}
@@ -902,7 +963,7 @@ def main() -> None:
 
         if not args.dry_run:
             _write_lang_marker(season_dir, arc["marker"])
-            push_arc_metrics(args.pushgateway, arcs, show_dir)
+            push_arc_metrics(args.pushgateway, arcs, show_dir, canon_arcs)
 
         arc_new = stats["downloaded"] - stats.get("_prev_downloaded", 0)
         stats["_prev_downloaded"] = stats["downloaded"]
