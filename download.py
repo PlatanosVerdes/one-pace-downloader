@@ -836,19 +836,6 @@ def main() -> None:
     for arc in arcs:
         season_dir = show_dir / f"Season {arc['season']:02d}"
 
-        stored = _read_lang_marker(season_dir)
-        disagrees = _disk_disagrees(season_dir, arc["marker"])
-        if _needs_replacing(stored, arc["marker"]):
-            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: marker says "
-                  f"{stored}, wanted as {arc['marker']}")
-            _clear_season(season_dir, f"{stored} replaced by {arc['marker']}", args.dry_run)
-        elif disagrees:
-            audio, subtitles = disagrees
-            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: files are "
-                  f"{audio} audio / {subtitles} subs, wanted as {arc['marker']}")
-            _clear_season(season_dir, f"{audio}/{subtitles} replaced by {arc['marker']}",
-                          args.dry_run)
-
         print(f"\n=== S{arc['season']:02d} {arc['title']} [{arc['resolution']}] — {arc['variant']} ===")
         print(f"    pixeldrain folder: {arc['pd_list_id']}")
 
@@ -873,6 +860,26 @@ def main() -> None:
                   f"{', '.join(f['name'] for f in extras[:3])}")
 
         print(f"  {len(files)} file(s) in folder")
+
+        # The replacement decision needs the source listing above, because a source with
+        # fewer episodes than the season already holds cannot replace it. The Spanish side
+        # of an arc still in progress publishes one episode where the English side has five.
+        stored = _read_lang_marker(season_dir)
+        disagrees = _disk_disagrees(season_dir, arc["marker"])
+        on_disk = len(_season_videos(season_dir))
+        wants_replacing = _needs_replacing(stored, arc["marker"]) or disagrees
+        if wants_replacing and len(files) < on_disk:
+            print(f"  [keep]  {on_disk} file(s) on disk, this source has only "
+                  f"{len(files)}: leaving the season alone")
+        elif _needs_replacing(stored, arc["marker"]):
+            print(f"  [replace] marker says {stored}, wanted as {arc['marker']}")
+            _clear_season(season_dir, f"{stored} replaced by {arc['marker']}", args.dry_run)
+        elif disagrees:
+            audio, subtitles = disagrees
+            print(f"  [replace] files are {audio} audio / {subtitles} subs, "
+                  f"wanted as {arc['marker']}")
+            _clear_season(season_dir, f"{audio}/{subtitles} replaced by {arc['marker']}",
+                          args.dry_run)
 
         if args.dry_run:
             for f in files:
