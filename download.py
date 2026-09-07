@@ -168,6 +168,37 @@ def _marker_parts(marker: str | None) -> tuple[str | None, str | None]:
     return lang, kind or None
 
 
+def _season_videos(season_dir: Path) -> list[Path]:
+    if not season_dir.exists():
+        return []
+    return [f for f in season_dir.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES]
+
+
+def _marker_variant(marker: str) -> tuple[str, str]:
+    """The (audio, subtitles) a marker asks for, in the same shape _variant_from_name reads
+    off a filename, so the two can be compared."""
+    language, kind = _marker_parts(marker)
+    if kind == "dub":
+        return language or "unknown", "none"
+    return "original", language or "unknown"
+
+
+def _disk_disagrees(season_dir: Path, marker: str) -> tuple[str, str] | None:
+    """The (audio, subtitles) actually on disk when it is not what `marker` asks for.
+
+    A marker can be right about the past and wrong about the present: a run that replaced
+    half a season and died, or one that wrote the marker before an older file was removed.
+    Files nobody can classify are left alone rather than replaced on every pass forever.
+    """
+    counts = collections.Counter(_variant_from_name(f.name) for f in _season_videos(season_dir))
+    if not counts:
+        return None
+    found = _season_variant(counts)
+    if found == ("unknown", "unknown") or found == _marker_variant(marker):
+        return None
+    return found
+
+
 def _needs_replacing(stored: str | None, current: str) -> bool:
     """True when what is on disk was taken under preferences that no longer apply. Only the
     fields the stored marker carries are compared."""
@@ -806,10 +837,17 @@ def main() -> None:
         season_dir = show_dir / f"Season {arc['season']:02d}"
 
         stored = _read_lang_marker(season_dir)
+        disagrees = _disk_disagrees(season_dir, arc["marker"])
         if _needs_replacing(stored, arc["marker"]):
-            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: on disk as "
+            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: marker says "
                   f"{stored}, wanted as {arc['marker']}")
             _clear_season(season_dir, f"{stored} replaced by {arc['marker']}", args.dry_run)
+        elif disagrees:
+            audio, subtitles = disagrees
+            print(f"\n[replace] S{arc['season']:02d} {arc['title']}: files are "
+                  f"{audio} audio / {subtitles} subs, wanted as {arc['marker']}")
+            _clear_season(season_dir, f"{audio}/{subtitles} replaced by {arc['marker']}",
+                          args.dry_run)
 
         print(f"\n=== S{arc['season']:02d} {arc['title']} [{arc['resolution']}] — {arc['variant']} ===")
         print(f"    pixeldrain folder: {arc['pd_list_id']}")
