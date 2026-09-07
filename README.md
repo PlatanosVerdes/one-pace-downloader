@@ -140,8 +140,20 @@ If you run a Prometheus Pushgateway, pass `--pushgateway http://pushgateway:9091
 
 **Per arc** (pushed to `/type/arc-status` grouping key):
 - `onepace_arc_episodes_on_disk{arc_id, title, season, available_es, available_en, lang, variant}`
+- `onepace_arc_files_on_disk{arc_id, title, season, audio, subtitles}`
 
-The per-arc metric powers the Arc Status table in Grafana, showing which arcs are available in Spanish/English and what language is currently on disk.
+The first powers the Arc Status table in Grafana, showing which arcs are available in Spanish/English and what the marker says is on disk.
+
+The second reports what the files themselves say, one series per audio/subtitle pair, so a season part-way through a replacement shows both halves:
+
+| filename tag | `audio` | `subtitles` |
+|---|---|---|
+| `[Es Sub]` | `original` | `es` |
+| `[En Sub]` | `original` | `en` |
+| `[Es Dub]` | `es` | `none` |
+| no tag | `unknown` | `unknown` |
+
+Both labels come off the filename, not off the `.lang` marker: the marker records what a run meant to fetch, the filename records what it got, and the two can disagree. `sum(onepace_arc_files_on_disk{audio!="original"})` is therefore the count of episodes that are actually dubbed, whatever the markers claim, and it should be zero.
 
 ---
 
