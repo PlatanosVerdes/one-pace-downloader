@@ -1,4 +1,13 @@
-# one-pace-downloader
+<p align="center">
+  <img src="assets/icon.svg" width="96" alt="">
+</p>
+
+<h1 align="center">one-pace-downloader</h1>
+
+<p align="center">
+  <a href="https://github.com/PlatanosVerdes/one-pace-downloader/tags"><img src="https://img.shields.io/github/v/tag/PlatanosVerdes/one-pace-downloader?label=release&color=2f7d3a" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/python-3-3776ab?logo=python&logoColor=white" alt="Python">
+</p>
 
 A Python downloader for [One Pace](https://onepace.net/es/watch) episodes, organized for Jellyfin (or any media server that follows the `Show/Season XX/` structure).
 
